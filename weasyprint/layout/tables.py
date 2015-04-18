@@ -5,7 +5,7 @@
 
     Layout for tables and internal table boxes.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
@@ -20,7 +20,7 @@ from .percentages import resolve_percentages, resolve_one_percentage
 from .preferred import table_and_columns_preferred_widths
 
 
-def table_layout(document, table, max_position_y, skip_stack,
+def table_layout(context, table, max_position_y, skip_stack,
                  containing_block, device_size, page_is_empty, absolute_boxes,
                  fixed_boxes):
     """Layout for a table box.
@@ -33,9 +33,14 @@ def table_layout(document, table, max_position_y, skip_stack,
 
     column_widths = table.column_widths
 
-    border_spacing_x, border_spacing_y = table.style.border_spacing
+    if table.style.border_collapse == 'separate':
+        border_spacing_x, border_spacing_y = table.style.border_spacing
+    else:
+        border_spacing_x = 0
+        border_spacing_y = 0
+
     # TODO: reverse this for direction: rtl
-    column_positions = []
+    column_positions = table.column_positions = []
     position_x = table.content_box_x()
     rows_x = position_x + border_spacing_x
     for width in column_widths:
@@ -43,6 +48,23 @@ def table_layout(document, table, max_position_y, skip_stack,
         column_positions.append(position_x)
         position_x += width
     rows_width = position_x - rows_x
+
+    if table.style.border_collapse == 'collapse':
+        if skip_stack:
+            skipped_groups, group_skip_stack = skip_stack
+            if group_skip_stack:
+                skipped_rows, _ = group_skip_stack
+            else:
+                skipped_rows = 0
+            for group in table.children[:skipped_groups]:
+                skipped_rows += len(group.children)
+        else:
+            skipped_rows = 0
+        _, horizontal_borders = table.collapsed_border_grid
+        if horizontal_borders:
+            table.style.border_top_width = table.border_top_width = max(
+                width for _, (_, width, _)
+                in horizontal_borders[skipped_rows]) / 2
 
     # Make this a sub-function so that many local variables like rows_x
     # need not be passed as parameters.
@@ -62,6 +84,7 @@ def table_layout(document, table, max_position_y, skip_stack,
             skip = 0
         else:
             skip, skip_stack = skip_stack
+            assert not skip_stack  # No breaks inside rows for now
         for index_row, row in group.enumerate_skip(skip):
             resolve_percentages(row, containing_block=table)
             row.position_x = rows_x
@@ -82,9 +105,9 @@ def table_layout(document, table, max_position_y, skip_stack,
                     # grid_x, so they are beyond too.
                     cell_index = row.children.index(cell)
                     ignored_cells = row.children[cell_index:]
-                    LOGGER.warn('This table row has more columns than '
-                                'the table, ignored %i cells: %r',
-                                len(ignored_cells), ignored_cells)
+                    LOGGER.warning('This table row has more columns than '
+                                   'the table, ignored %i cells: %r',
+                                   len(ignored_cells), ignored_cells)
                     break
                 resolve_percentages(cell, containing_block=table)
                 cell.position_x = column_positions[cell.grid_x]
@@ -101,7 +124,7 @@ def table_layout(document, table, max_position_y, skip_stack,
                 computed_cell_height = cell.height
                 cell.height = 'auto'
                 cell, _, _, _, _ = block_container_layout(
-                    document, cell,
+                    context, cell,
                     max_position_y=float('inf'),
                     skip_stack=None,
                     device_size=device_size,
@@ -144,7 +167,11 @@ def table_layout(document, table, max_position_y, skip_stack,
                 row_bottom_y = max(
                     cell.position_y + cell.border_height()
                     for cell in ending_cells)
-                row.height = row_bottom_y - row.position_y
+                if row.height == 'auto':
+                    row.height = row_bottom_y - row.position_y
+                else:
+                    row.height = max(row.height, max(
+                        row_cell.height for row_cell in ending_cells))
             else:
                 row_bottom_y = row.position_y
                 row.height = 0
@@ -226,9 +253,7 @@ def table_layout(document, table, max_position_y, skip_stack,
             if resume_at:
                 resume_at = (index_group, resume_at)
                 break
-
         return new_table_children, resume_at, position_y
-
 
     # Layout for row groups, rows and cells
     position_y = table.content_box_y() + border_spacing_y
@@ -310,7 +335,6 @@ def table_layout(document, table, max_position_y, skip_stack,
             skip_stack, position_y, max_position_y, page_is_empty)
         return header, new_table_children, footer, end_position_y, resume_at
 
-
     header, new_table_children, footer, position_y, resume_at = \
         all_groups_layout()
     table = table.copy_with_children(
@@ -318,6 +342,8 @@ def table_layout(document, table, max_position_y, skip_stack,
         new_table_children +
         ([footer] if footer is not None else []),
         is_start=skip_stack is None, is_end=resume_at is None)
+    if table.style.border_collapse == 'collapse':
+        table.skipped_rows = skipped_rows
 
     # If the height property has a bigger value, just add blank space
     # below the last row group.
@@ -374,7 +400,7 @@ def fixed_table_layout(box):
     assert table.width != 'auto'
 
     all_columns = [column for column_group in table.column_groups
-                          for column in column_group.children]
+                   for column in column_group.children]
     if table.children and table.children[0].children:
         first_rowgroup = table.children[0]
         first_row_cells = first_rowgroup.children[0].children
@@ -393,8 +419,12 @@ def fixed_table_layout(box):
         if column.width != 'auto':
             column_widths[i] = column.width
 
+    if table.style.border_collapse == 'separate':
+        border_spacing_x, _ = table.style.border_spacing
+    else:
+        border_spacing_x = 0
+
     # `width` on cells of the first row.
-    border_spacing_x, border_spacing_y = table.style.border_spacing
     i = 0
     for cell in first_row_cells:
         resolve_percentages(cell, table)
@@ -402,7 +432,7 @@ def fixed_table_layout(box):
             width = cell.border_width()
             width -= border_spacing_x * (cell.colspan - 1)
             # In the general case, this width affects several columns (through
-            # colspan) some of which already have a width. Subscract these
+            # colspan) some of which already have a width. Subtract these
             # known widths and divide among remaining columns.
             columns_without_width = []  # and occupied by this cell
             for j in xrange(i, i + cell.colspan):
@@ -414,7 +444,9 @@ def fixed_table_layout(box):
                 width_per_column = width / len(columns_without_width)
                 for j in columns_without_width:
                     column_widths[j] = width_per_column
+            del width
         i += cell.colspan
+    del i
 
     # Distribute the remaining space equally on columns that do not have
     # a width yet.
@@ -422,7 +454,7 @@ def fixed_table_layout(box):
     min_table_width = (sum(w for w in column_widths if w is not None)
                        + all_border_spacing)
     columns_without_width = [i for i, width in enumerate(column_widths)
-                               if width is None]
+                             if width is None]
     if columns_without_width and table.width >= min_table_width:
         remaining_width = table.width - min_table_width
         width_per_column = remaining_width / len(columns_without_width)
@@ -449,7 +481,7 @@ def fixed_table_layout(box):
     table.column_widths = column_widths
 
 
-def auto_table_layout(document, box, containing_block):
+def auto_table_layout(context, box, containing_block):
     """Run the auto table layout and return a list of column widths.
 
     http://www.w3.org/TR/CSS21/tables.html#auto-table-layout
@@ -459,10 +491,15 @@ def auto_table_layout(document, box, containing_block):
     (table_preferred_minimum_width, table_preferred_width,
      column_preferred_minimum_widths, column_preferred_widths) = \
         table_and_columns_preferred_widths(
-            document, box, resolved_table_width=True)
+            context, box, resolved_table_width=table.width != 'auto')
+
+    if table.style.border_collapse == 'separate':
+        border_spacing_x, _ = table.style.border_spacing
+    else:
+        border_spacing_x = 0
 
     all_border_spacing = (
-        table.style.border_spacing[0] * (len(column_preferred_widths) + 1))
+        border_spacing_x * (len(column_preferred_widths) + 1))
 
     margins = 0
     if box.margin_left != 'auto':
@@ -506,7 +543,7 @@ def auto_table_layout(document, box, containing_block):
                 for column_width in table.column_widths]
 
 
-def table_wrapper_width(document, wrapper, containing_block):
+def table_wrapper_width(context, wrapper, containing_block):
     """Find the width of each column and derive the wrapper width."""
     table = wrapper.get_wrapped_table()
     resolve_percentages(table, containing_block)
@@ -514,7 +551,7 @@ def table_wrapper_width(document, wrapper, containing_block):
     if table.style.table_layout == 'fixed' and table.width != 'auto':
         fixed_table_layout(wrapper)
     else:
-        auto_table_layout(document, wrapper, containing_block)
+        auto_table_layout(context, wrapper, containing_block)
 
     wrapper.width = table.border_width()
     wrapper.style.width = Dimension(wrapper.width, 'px')
@@ -527,8 +564,8 @@ def cell_baseline(cell):
     See http://www.w3.org/TR/CSS21/tables.html#height-layout
 
     """
-    result = find_in_flow_baseline(cell,
-        baseline_types=(boxes.LineBox, boxes.TableRowBox))
+    result = find_in_flow_baseline(
+        cell, baseline_types=(boxes.LineBox, boxes.TableRowBox))
     if result is not None:
         return result - cell.position_y
     else:
@@ -543,7 +580,8 @@ def find_in_flow_baseline(box, last=False, baseline_types=(boxes.LineBox,)):
     """
     if isinstance(box, baseline_types):
         return box.position_y + box.baseline
-    if isinstance(box, boxes.ParentBox):
+    if isinstance(box, boxes.ParentBox) and not isinstance(
+            box, boxes.TableCaptionBox):
         children = reversed(box.children) if last else box.children
         for child in children:
             if child.is_in_normal_flow():

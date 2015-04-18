@@ -52,12 +52,14 @@
 
     See respective docstrings for details.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
+
+import itertools
 
 from ..compat import xrange
 from ..css.computed_values import ZERO_PIXELS
@@ -79,6 +81,11 @@ class Box(object):
     is_for_root_element = False
     bookmark_label = None
     bookmark_level = None
+    transformation_matrix = None
+
+    # Default, overriden on some subclasses
+    def all_children(self):
+        return ()
 
     def __init__(self, element_tag, sourceline, style):
         self.element_tag = element_tag
@@ -121,6 +128,8 @@ class Box(object):
         # Overridden in ParentBox to also translate children, if any.
         self.position_x += dx
         self.position_y += dy
+        for child in self.all_children():
+            child.translate(dx, dy)
 
     # Heights and widths
 
@@ -182,8 +191,81 @@ class Box(object):
         """Return the (x, y, w, h) rectangle where the box is clickable."""
         # "Border area. That's the area that hit-testing is done on."
         # http://lists.w3.org/Archives/Public/www-style/2012Jun/0318.html
+        # TODO: manage the border radii, use outer_border_radii instead
         return (self.border_box_x(), self.border_box_y(),
                 self.border_width(), self.border_height())
+
+    def rounded_box(self, bt, br, bb, bl):
+        """Position, size and radii of a box inside the outer border box.
+
+        bt, br, bb, and bl are distances from the outer border box,
+        defining a rectangle to be rounded.
+
+        """
+        tlrx, tlry = self.border_top_left_radius
+        trrx, trry = self.border_top_right_radius
+        brrx, brry = self.border_bottom_right_radius
+        blrx, blry = self.border_bottom_left_radius
+
+        tlrx = max(0, tlrx - bl)
+        tlry = max(0, tlry - bt)
+        trrx = max(0, trrx - br)
+        trry = max(0, trry - bt)
+        brrx = max(0, brrx - br)
+        brry = max(0, brry - bb)
+        blrx = max(0, blrx - bl)
+        blry = max(0, blry - bb)
+
+        x = self.border_box_x() + bl
+        y = self.border_box_y() + bt
+        width = self.border_width() - bl - br
+        height = self.border_height() - bt - bb
+
+        # Fix overlapping curves
+        # See http://www.w3.org/TR/css3-background/#corner-overlap
+        ratio = min([1] + [
+            extent / sum_radii
+            for extent, sum_radii in [
+                (width, tlrx + trrx),
+                (width, blrx + brrx),
+                (height, tlry + blry),
+                (height, trry + brry),
+            ]
+            if sum_radii > 0
+        ])
+        return (
+            x, y, width, height,
+            (tlrx * ratio, tlry * ratio),
+            (trrx * ratio, trry * ratio),
+            (brrx * ratio, brry * ratio),
+            (blrx * ratio, blry * ratio))
+
+    def rounded_box_ratio(self, ratio):
+        return self.rounded_box(
+            self.border_top_width * ratio,
+            self.border_right_width * ratio,
+            self.border_bottom_width * ratio,
+            self.border_left_width * ratio)
+
+    def rounded_padding_box(self):
+        """Return the position, size and radii of the rounded padding box."""
+        return self.rounded_box(
+            self.border_top_width,
+            self.border_right_width,
+            self.border_bottom_width,
+            self.border_left_width)
+
+    def rounded_border_box(self):
+        """Return the position, size and radii of the rounded border box."""
+        return self.rounded_box(0, 0, 0, 0)
+
+    def rounded_content_box(self):
+        """Return the position, size and radii of the rounded content box."""
+        return self.rounded_box(
+            self.border_top_width + self.padding_top,
+            self.border_right_width + self.padding_right,
+            self.border_bottom_width + self.padding_bottom,
+            self.border_left_width + self.padding_left)
 
     # Positioning schemes
 
@@ -205,6 +287,9 @@ class ParentBox(Box):
     def __init__(self, element_tag, sourceline, style, children):
         super(ParentBox, self).__init__(element_tag, sourceline, style)
         self.children = tuple(children)
+
+    def all_children(self):
+        return self.children
 
     def enumerate_skip(self, skip_num=0):
         """Yield ``(child, child_index)`` tuples for each child.
@@ -231,10 +316,10 @@ class ParentBox(Box):
         if end:
             self._reset_spacing('bottom')
 
-    def copy_with_children(self, children, is_start=True, is_end=True):
-        """Create a new equivalent box with given ``children``."""
+    def copy_with_children(self, new_children, is_start=True, is_end=True):
+        """Create a new equivalent box with given ``new_children``."""
         new_box = self.copy()
-        new_box.children = tuple(children)
+        new_box.children = tuple(new_children)
         if not is_start:
             new_box.outside_list_marker = None
             if new_box.bookmark_level:
@@ -251,16 +336,6 @@ class ParentBox(Box):
                     yield grand_child
             else:
                 yield child
-
-    def translate(self, dx=0, dy=0):
-        """Change the position of the box.
-
-        Also update the children’s positions accordingly.
-
-        """
-        super(ParentBox, self).translate(dx, dy)
-        for child in self.children:
-            child.translate(dx, dy)
 
     def get_wrapped_table(self):
         """Get the table wrapped by the box."""
@@ -303,16 +378,10 @@ class BlockBox(BlockContainerBox, BlockLevelBox):
 
     """
     # TODO: remove this when outside list marker are absolute children
-    def translate(self, dx=0, dy=0):
-        """Change the position of the box.
-
-        Also update the children’s positions accordingly.
-
-        """
-        super(BlockBox, self).translate(dx, dy)
+    def all_children(self):
         marker = getattr(self, 'outside_list_marker', None)
-        if marker:
-            marker.translate(dx, dy)
+        return (itertools.chain(self.children, [marker])
+                if marker else self.children)
 
 
 class LineBox(ParentBox):
@@ -384,6 +453,8 @@ class TextBox(InlineLevelBox):
                 # Python’s unicode.captitalize is not the same.
                 'capitalize': lambda t: t.title(),
             }[text_transform](text)
+        if style.hyphens == 'none':
+            text = text.replace('\u00AD', '')  # U+00AD SOFT HYPHEN (SHY)
         self.text = text
 
     def copy_with_text(self, text):
@@ -450,16 +521,13 @@ class TableBox(BlockLevelBox, ParentBox):
     # http://www.w3.org/TR/CSS21/tables.html#anonymous-boxes
     tabular_container = True
 
+    def all_children(self):
+        return itertools.chain(self.children, self.column_groups)
+
     def translate(self, dx=0, dy=0):
-        """Change the position of the box.
-
-        Also update the children’s positions accordingly.
-
-        """
-        super(TableBox, self).translate(dx, dy)
-        for child in self.column_groups:
-            # TODO: why did we not put these in .children again?
-            child.translate(dx, dy)
+        self.column_positions = [
+            position + dx for position in self.column_positions]
+        return super(TableBox, self).translate(dx, dy)
 
 
 class InlineTableBox(TableBox):
@@ -507,7 +575,7 @@ class TableColumnGroupBox(ParentBox):
     padding_right = 0
 
 
-# Not really a parent box, but pretending to be removes some special cases.
+# Not really a parent box, but pretending to be removes some corner cases.
 class TableColumnBox(ParentBox):
     """Box for elements with ``display: table-column``"""
     proper_table_child = True
@@ -555,7 +623,6 @@ class PageBox(ParentBox):
     def __init__(self, page_type, style):
         self.page_type = page_type
         # Page boxes are not linked to any element.
-        self.fixed_boxes = []
         super(PageBox, self).__init__(
             element_tag=None, sourceline=None, style=style, children=[])
 

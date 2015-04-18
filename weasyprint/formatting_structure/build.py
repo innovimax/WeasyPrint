@@ -9,7 +9,7 @@
     This includes creating anonymous boxes and processing whitespace
     as necessary.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
@@ -17,9 +17,13 @@
 from __future__ import division, unicode_literals
 
 import re
+
+from tinycss.color3 import COLOR_KEYWORDS
+
 from . import boxes, counters
 from .. import html
 from ..css import properties
+from ..css.computed_values import ZERO_PIXELS
 from ..compat import basestring, xrange
 
 
@@ -42,10 +46,22 @@ BOX_TYPE_FROM_DISPLAY = {
 }
 
 
-def build_formatting_structure(document, computed_styles):
-    """Build a formatting structure (box tree) from a ``document``."""
-    # TODO: use computed_styles intsead of document.style_for()
-    box, = dom_to_box(document, document.dom)
+def build_formatting_structure(element_tree, style_for, get_image_from_uri):
+    """Build a formatting structure (box tree) from an element tree."""
+    box_list = element_to_box(element_tree, style_for, get_image_from_uri)
+    if box_list:
+        box, = box_list
+    else:
+        # No root element
+        def root_style_for(element, pseudo_type=None):
+            style = style_for(element, pseudo_type)
+            if style:
+                if element.getparent() is None:
+                    style.display = 'block'
+                else:
+                    style.display = 'none'
+            return style
+        box, = element_to_box(element_tree, root_style_for, get_image_from_uri)
     box.is_for_root_element = True
     # If this is changed, maybe update weasy.layout.pages.make_margin_boxes()
     process_whitespace(box)
@@ -53,20 +69,34 @@ def build_formatting_structure(document, computed_styles):
     box = inline_in_block(box)
     box = block_in_inline(box)
     box = resolve_bookmark_labels(box)
-    box = set_canvas_background(box)
     box = set_viewport_overflow(box)
     return box
 
 
-def dom_to_box(document, element, state=None):
-    """Convert a DOM element and its children into a box with children.
+def make_box(element_tag, sourceline, style, content, get_image_from_uri):
+    if (style.display in ('table', 'inline-table')
+            and style.border_collapse == 'collapse'):
+        # Padding do not apply
+        for side in ['top', 'bottom', 'left', 'right']:
+            style['padding_' + side] = ZERO_PIXELS
+    if style.display.startswith('table-') and style.display != 'table-caption':
+        # Margins do not apply
+        for side in ['top', 'bottom', 'left', 'right']:
+            style['margin_' + side] = ZERO_PIXELS
+
+    return BOX_TYPE_FROM_DISPLAY[style.display](element_tag, sourceline,
+                                                style, content)
+
+
+def element_to_box(element, style_for, get_image_from_uri, state=None):
+    """Convert an element and its children into a box with children.
 
     Return a list of boxes. Most of the time the list will have one item but
     may have zero or more than one.
 
     Eg.::
 
-        <p>Some <em>emphasised</em> text.<p>
+        <p>Some <em>emphasised</em> text.</p>
 
     gives (not actual syntax)::
 
@@ -87,7 +117,7 @@ def dom_to_box(document, element, state=None):
         # Here we ignore comments and XML processing instructions.
         return []
 
-    style = document.style_for(element)
+    style = style_for(element)
 
     # TODO: should be the used value. When does the used value for `display`
     # differ from the computer value?
@@ -95,8 +125,8 @@ def dom_to_box(document, element, state=None):
     if display == 'none':
         return []
 
-    box = BOX_TYPE_FROM_DISPLAY[display](
-        element.tag, element.sourceline, style, [])
+    box = make_box(element.tag, element.sourceline, style, [],
+                   get_image_from_uri)
 
     if state is None:
         # use a list to have a shared mutable object
@@ -104,7 +134,7 @@ def dom_to_box(document, element, state=None):
             # Shared mutable objects:
             [0],  # quote_depth: single integer
             {},  # counter_values: name -> stacked/scoped values
-            [set()]  # counter_scopes: DOM tree depths -> counter names
+            [set()]  # counter_scopes: element tree depths -> counter names
         )
     _quote_depth, counter_values, counter_scopes = state
 
@@ -112,22 +142,30 @@ def dom_to_box(document, element, state=None):
 
     children = []
     if display == 'list-item':
-        children.extend(add_box_marker(document, counter_values, box))
+        children.extend(add_box_marker(
+            box, counter_values, get_image_from_uri))
 
     # If this element’s direct children create new scopes, the counter
     # names will be in this new list
     counter_scopes.append(set())
 
-    children.extend(pseudo_to_box(document, state, element, 'before'))
+    children.extend(pseudo_to_box(
+        element, 'before', state, style_for, get_image_from_uri))
     text = element.text
     if text:
         children.append(boxes.TextBox.anonymous_from(box, text))
     for child_element in element:
-        children.extend(dom_to_box(document, child_element, state))
+        children.extend(element_to_box(
+            child_element, style_for, get_image_from_uri, state))
         text = child_element.tail
         if text:
-            children.append(boxes.TextBox.anonymous_from(box, text))
-    children.extend(pseudo_to_box(document, state, element, 'after'))
+            text_box = boxes.TextBox.anonymous_from(box, text)
+            if children and isinstance(children[-1], boxes.TextBox):
+                children[-1].text += text_box.text
+            else:
+                children.append(text_box)
+    children.extend(pseudo_to_box(
+        element, 'after', state, style_for, get_image_from_uri))
 
     # Scopes created by this element’s children stop here.
     for name in counter_scopes.pop():
@@ -138,12 +176,12 @@ def dom_to_box(document, element, state=None):
     box = box.copy_with_children(children)
 
     # Specific handling for the element. (eg. replaced element)
-    return html.handle_element(document, element, box)
+    return html.handle_element(element, box, get_image_from_uri)
 
 
-def pseudo_to_box(document, state, element, pseudo_type):
+def pseudo_to_box(element, pseudo_type, state, style_for, get_image_from_uri):
     """Yield the box for a :before or :after pseudo-element if there is one."""
-    style = document.style_for(element, pseudo_type)
+    style = style_for(element, pseudo_type)
     if pseudo_type and style is None:
         # Pseudo-elements with no style at all do not get a StyleDict
         # Their initial content property computes to 'none'.
@@ -156,28 +194,31 @@ def pseudo_to_box(document, state, element, pseudo_type):
     if 'none' in (display, content) or content == 'normal':
         return
 
-    box = BOX_TYPE_FROM_DISPLAY[display](
-        '%s:%s' % (element.tag, pseudo_type), element.sourceline, style, [])
+    box = make_box(
+        '%s:%s' % (element.tag, pseudo_type), element.sourceline, style, [],
+        get_image_from_uri)
 
     quote_depth, counter_values, _counter_scopes = state
     update_counters(state, style)
     children = []
     if display == 'list-item':
-        children.extend(add_box_marker(document, counter_values, box))
+        children.extend(add_box_marker(
+            box, counter_values, get_image_from_uri))
     children.extend(content_to_boxes(
-        document, style, box, quote_depth, counter_values))
+        style, box, quote_depth, counter_values, get_image_from_uri))
 
     yield box.copy_with_children(children)
 
 
-def content_to_boxes(document, style, parent_box, quote_depth, counter_values):
+def content_to_boxes(style, parent_box, quote_depth, counter_values,
+                     get_image_from_uri):
     """Takes the value of a ``content`` property and yield boxes."""
     texts = []
     for type_, value in style.content:
         if type_ == 'STRING':
             texts.append(value)
         elif type_ == 'URI':
-            image = document.get_image_from_uri(value)
+            image = get_image_from_uri(value)
             if image is not None:
                 text = ''.join(texts)
                 if text:
@@ -250,7 +291,7 @@ def update_counters(state, style):
         values[-1] += value
 
 
-def add_box_marker(document, counter_values, box):
+def add_box_marker(box, counter_values, get_image_from_uri):
     """Add a list marker to boxes for elements with ``display: list-item``,
     and yield children to add a the start of the box.
 
@@ -258,12 +299,10 @@ def add_box_marker(document, counter_values, box):
 
     """
     style = box.style
-    image = style.list_style_image
-    if image != 'none':
+    image_type, image = style.list_style_image
+    if image_type == 'url':
         # surface may be None here too, in case the image is not available.
-        image = document.get_image_from_uri(image)
-    else:
-        image = None
+        image = get_image_from_uri(image)
 
     if image is None:
         type_ = style.list_style_type
@@ -396,7 +435,8 @@ def table_boxes_children(box, children):
 
     if isinstance(box, boxes.TableBox):
         # Rule 2.1
-        children = wrap_improper(box, children, boxes.TableRowBox,
+        children = wrap_improper(
+            box, children, boxes.TableRowBox,
             lambda child: child.proper_table_child)
     elif isinstance(box, boxes.TableRowGroupBox):
         # Rule 2.2
@@ -407,20 +447,21 @@ def table_boxes_children(box, children):
         children = wrap_improper(box, children, boxes.TableCellBox)
     else:
         # Rule 3.1
-        children = wrap_improper(box, children, boxes.TableRowBox,
+        children = wrap_improper(
+            box, children, boxes.TableRowBox,
             lambda child: not isinstance(child, boxes.TableCellBox))
 
     # Rule 3.2
     if isinstance(box, boxes.InlineBox):
-        children = wrap_improper(box, children, boxes.InlineTableBox,
+        children = wrap_improper(
+            box, children, boxes.InlineTableBox,
             lambda child: not child.proper_table_child)
     else:
         parent_type = type(box)
-        children = wrap_improper(box, children, boxes.TableBox,
-            lambda child:
-                not child.proper_table_child or
-                parent_type in child.proper_parents)
-
+        children = wrap_improper(
+            box, children, boxes.TableBox,
+            lambda child: (not child.proper_table_child or
+                           parent_type in child.proper_parents))
 
     if isinstance(box, boxes.TableBox):
         return wrap_table(box, children)
@@ -431,7 +472,10 @@ def table_boxes_children(box, children):
 def wrap_table(box, children):
     """Take a table box and return it in its table wrapper box.
 
-    Also re-order children and assign grid positions to each column an cell.
+    Also re-order children and assign grid positions to each column and cell.
+
+    Because of colspan/rowspan works, grid_y is implicitly the index of a row,
+    but grid_x is an explicit attribute on cells, columns and column group.
 
     http://www.w3.org/TR/CSS21/tables.html#model
     http://www.w3.org/TR/CSS21/tables.html#table-layout
@@ -469,12 +513,14 @@ def wrap_table(box, children):
             group.span = len(group.children)
         else:
             grid_x += group.span
+    grid_width = grid_x
 
+    row_groups = wrap_improper(box, rows, boxes.TableRowGroupBox)
     # Extract the optional header and footer groups.
     body_row_groups = []
     header = None
     footer = None
-    for group in wrap_improper(box, rows, boxes.TableRowGroupBox):
+    for group in row_groups:
         display = group.style.display
         if display == 'table-header-group' and header is None:
             group.is_header = True
@@ -484,7 +530,6 @@ def wrap_table(box, children):
             footer = group
         else:
             body_row_groups.append(group)
-
     row_groups = (
         ([header] if header is not None else []) +
         body_row_groups +
@@ -496,6 +541,7 @@ def wrap_table(box, children):
     # http://www.w3.org/TR/CSS21/tables.html#table-layout
     # Column 0 is on the left if direction is ltr, right if rtl.
     # This algorithm does not change.
+    grid_height = 0
     for group in row_groups:
         # Indexes: row number in the group.
         # Values: set of cells already occupied by row-spanning cells.
@@ -524,9 +570,14 @@ def wrap_table(box, children):
                     for occupied_cells in spanned_rows:
                         occupied_cells.update(spanned_columns)
                 grid_x = new_grid_x
+                grid_width = max(grid_width, grid_x)
+        grid_height += len(group.children)
 
     table = box.copy_with_children(row_groups)
     table.column_groups = tuple(column_groups)
+    if table.style.border_collapse == 'collapse':
+        table.collapsed_border_grid = collapse_table_borders(
+            table, grid_width, grid_height)
 
     if isinstance(box, boxes.InlineTableBox):
         wrapper_type = boxes.InlineBlockBox
@@ -545,6 +596,157 @@ def wrap_table(box, children):
     # else: non-inherited properties already have their initial values
 
     return wrapper
+
+
+def collapse_table_borders(table, grid_width, grid_height):
+    """Resolve border conflicts for a table in the collapsing border model.
+
+    Take a :class:`TableBox`; set appropriate border widths on the table,
+    column group, column, row group, row, and cell boxes; and return
+    a data structure for the resolved collapsed border grid.
+
+    """
+    if not (grid_width and grid_height):
+        # Don’t bother with empty tables
+        return [], []
+
+    style_scores = dict((v, i) for i, v in enumerate(reversed([
+        'hidden', 'double', 'solid', 'dashed', 'dotted', 'ridge',
+        'outset', 'groove', 'inset', 'none'])))
+    style_map = {'inset': 'ridge', 'outset': 'groove'}
+    transparent = COLOR_KEYWORDS['transparent']
+    weak_null_border = (
+        (0, 0, style_scores['none']), ('none', 0, transparent))
+    vertical_borders = [[weak_null_border for x in xrange(grid_width + 1)]
+                        for y in xrange(grid_height)]
+    horizontal_borders = [[weak_null_border for x in xrange(grid_width)]
+                          for y in xrange(grid_height + 1)]
+
+    def set_one_border(border_grid, box_style, side, grid_x, grid_y):
+        style = box_style['border_%s_style' % side]
+        width = box_style['border_%s_width' % side]
+        color = box_style.get_color('border_%s_color' % side)
+        style = style_map.get(style, style)
+
+        # http://www.w3.org/TR/CSS21/tables.html#border-conflict-resolution
+        score = ((1 if style == 'hidden' else 0), width, style_scores[style])
+
+        previous_score, _ = border_grid[grid_y][grid_x]
+        # Strict < so that the earlier call wins in case of a tie.
+        if previous_score < score:
+            border_grid[grid_y][grid_x] = (score, (style, width, color))
+
+    def set_borders(box, x, y, w, h):
+        style = box.style
+        for yy in xrange(y, y + h):
+            set_one_border(vertical_borders, style, 'left', x, yy)
+            set_one_border(vertical_borders, style, 'right', x + w, yy)
+        for xx in xrange(x, x + w):
+            set_one_border(horizontal_borders, style, 'top', xx, y)
+            set_one_border(horizontal_borders, style, 'bottom', xx, y + h)
+
+    # The order is important here:
+    # "A style set on a cell wins over one on a row, which wins over a
+    #  row group, column, column group and, lastly, table"
+    # See http://www.w3.org/TR/CSS21/tables.html#border-conflict-resolution
+    strong_null_border = (
+        (1, 0, style_scores['hidden']), ('hidden', 0, transparent))
+    grid_y = 0
+    for row_group in table.children:
+        for row in row_group.children:
+            for cell in row.children:
+                # No border inside of a cell with rowspan or colspan
+                for xx in xrange(cell.grid_x + 1, cell.grid_x + cell.colspan):
+                    for yy in xrange(grid_y, grid_y + cell.rowspan):
+                        vertical_borders[yy][xx] = strong_null_border
+                for xx in xrange(cell.grid_x, cell.grid_x + cell.colspan):
+                    for yy in xrange(grid_y + 1, grid_y + cell.rowspan):
+                        horizontal_borders[yy][xx] = strong_null_border
+                # The cell’s own borders
+                set_borders(cell, x=cell.grid_x, y=grid_y,
+                            w=cell.colspan, h=cell.rowspan)
+            grid_y += 1
+
+    grid_y = 0
+    for row_group in table.children:
+        for row in row_group.children:
+            set_borders(row, x=0, y=grid_y, w=grid_width, h=1)
+            grid_y += 1
+
+    grid_y = 0
+    for row_group in table.children:
+        rowspan = len(row_group.children)
+        set_borders(row_group, x=0, y=grid_y, w=grid_width, h=rowspan)
+        grid_y += rowspan
+
+    for column_group in table.column_groups:
+        for column in column_group.children:
+            set_borders(column, x=column.grid_x, y=0, w=1, h=grid_height)
+
+    for column_group in table.column_groups:
+        set_borders(column_group, x=column_group.grid_x, y=0,
+                    w=column_group.span, h=grid_height)
+
+    set_borders(table, x=0, y=0, w=grid_width, h=grid_height)
+
+    # Now that all conflicts are resolved, set transparent borders of
+    # the correct widths on each box. The actual border grid will be
+    # painted separately.
+    def set_transparent_border(box, side, twice_width):
+        style = box.style
+        style['border_%s_style' % side] = 'solid'
+        style['border_%s_width' % side] = twice_width / 2
+        style['border_%s_color' % side] = transparent
+
+    def remove_borders(box):
+        set_transparent_border(box, 'top', 0)
+        set_transparent_border(box, 'right', 0)
+        set_transparent_border(box, 'bottom', 0)
+        set_transparent_border(box, 'left', 0)
+
+    def max_vertical_width(x, y, h):
+        return max(
+            width for grid_row in vertical_borders[y:y+h]
+            for _, (_, width, _) in [grid_row[x]])
+
+    def max_horizontal_width(x, y, w):
+        return max(width for _, (_, width, _) in horizontal_borders[y][x:x+w])
+
+    grid_y = 0
+    for row_group in table.children:
+        remove_borders(row_group)
+        for row in row_group.children:
+            remove_borders(row)
+            for cell in row.children:
+                set_transparent_border(cell, 'top', max_horizontal_width(
+                    x=cell.grid_x, y=grid_y, w=cell.colspan))
+                set_transparent_border(cell, 'bottom', max_horizontal_width(
+                    x=cell.grid_x, y=grid_y + cell.rowspan, w=cell.colspan))
+                set_transparent_border(cell, 'left', max_vertical_width(
+                    x=cell.grid_x, y=grid_y, h=cell.rowspan))
+                set_transparent_border(cell, 'right', max_vertical_width(
+                    x=cell.grid_x + cell.colspan, y=grid_y, h=cell.rowspan))
+            grid_y += 1
+
+    for column_group in table.column_groups:
+        remove_borders(column_group)
+        for column in column_group.children:
+            remove_borders(column)
+
+    set_transparent_border(table, 'top', max_horizontal_width(
+        x=0, y=0, w=grid_width))
+    set_transparent_border(table, 'bottom', max_horizontal_width(
+        x=0, y=grid_height, w=grid_width))
+    # "UAs must compute an initial left and right border width for the table
+    #  by examining the first and last cells in the first row of the table."
+    # http://www.w3.org/TR/CSS21/tables.html#collapsing-borders
+    # ... so h=1, not grid_height:
+    set_transparent_border(table, 'left', max_vertical_width(
+        x=0, y=0, h=1))
+    set_transparent_border(table, 'right', max_vertical_width(
+        x=grid_width, y=0, h=1))
+
+    return vertical_borders, horizontal_borders
 
 
 def process_whitespace(box, following_collapsible_space=False):
@@ -589,6 +791,8 @@ def process_whitespace(box, following_collapsible_space=False):
             if following_collapsible_space and text.startswith(' '):
                 text = text[1:]
             following_collapsible_space = previous_text.endswith(' ')
+            if handling == 'nowrap':
+                text = re.sub('(?!^) (?!$)', '\xA0', text)
         else:
             following_collapsible_space = False
 
@@ -766,7 +970,8 @@ def block_in_inline(box):
 
     for child in box.children:
         if isinstance(child, boxes.LineBox):
-            assert len(box.children) == 1, ('Line boxes should have no '
+            assert len(box.children) == 1, (
+                'Line boxes should have no '
                 'siblings at this stage, got %r.' % box.children)
             stack = None
             while 1:
@@ -853,29 +1058,6 @@ def _inner_block_in_inline(box, skip_stack=None):
     return box, block_level_box, resume_at
 
 
-def set_canvas_background(root_box):
-    """
-    Set a ``canvas_background`` attribute on the box for the root element,
-    with style for the canvas background, taken from the root elememt
-    or a <body> child of the root element.
-
-    See http://www.w3.org/TR/CSS21/colors.html#background
-    """
-    chosen_box = root_box
-    if (root_box.element_tag.lower() == 'html' and
-            root_box.style.background_color.alpha == 0 and
-            root_box.style.background_image == 'none'):
-        for child in root_box.children:
-            if child.element_tag.lower() == 'body':
-                chosen_box = child
-                break
-
-    style = chosen_box.style
-    root_box.canvas_background = style
-    chosen_box.style = style.updated_copy(properties.BACKGROUND_INITIAL)
-    return root_box
-
-
 def set_viewport_overflow(root_box):
     """
     Set a ``viewport_overflow`` attribute on the box for the root element.
@@ -938,7 +1120,7 @@ TEXT_CONTENT_EXTRACTORS = {
     'contents': box_text_contents,
     'content-element': box_text_content_element,
     'content-before': box_text_content_before,
-    'content-before': box_text_content_after}
+    'content-after': box_text_content_after}
 
 
 def resolve_bookmark_labels(box):

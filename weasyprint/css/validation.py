@@ -6,7 +6,7 @@
     Expand shorthands and validate property values.
     See http://www.w3.org/TR/CSS21/propidx.html and various CSS3 modules.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
@@ -14,6 +14,7 @@
 from __future__ import division, unicode_literals
 
 import functools
+import math
 
 from tinycss.color3 import parse_color
 from tinycss.parsing import split_on_comma, remove_whitespace
@@ -21,7 +22,8 @@ from tinycss.parsing import split_on_comma, remove_whitespace
 from ..logger import LOGGER
 from ..formatting_structure import counters
 from ..compat import urljoin, unquote
-from ..urls import url_is_absolute
+from ..urls import url_is_absolute, iri_to_uri
+from ..images import LinearGradient, RadialGradient
 from .properties import (INITIAL_VALUES, KNOWN_PROPERTIES, NOT_PRINT_MEDIA,
                          Dimension)
 from . import computed_values
@@ -30,8 +32,8 @@ from . import computed_values
 
 
 # get the sets of keys
-LENGTH_UNITS = set(computed_values.LENGTHS_TO_PIXELS) | set(['ex', 'em'])
-ANGLE_UNITS = set(computed_values.ANGLE_TO_RADIANS)
+LENGTH_UNITS = set(computed_values.LENGTHS_TO_PIXELS) | set(['ex', 'em', 'ch'])
+
 
 # keyword -> (open, insert)
 CONTENT_QUOTE_KEYWORDS = {
@@ -41,12 +43,15 @@ CONTENT_QUOTE_KEYWORDS = {
     'no-close-quote': (False, False),
 }
 
+ZERO_PERCENT = Dimension(0, '%')
+FIFTY_PERCENT = Dimension(50, '%')
+HUNDRED_PERCENT = Dimension(100, '%')
 BACKGROUND_POSITION_PERCENTAGES = {
-    'top': Dimension(0, '%'),
-    'left': Dimension(0, '%'),
-    'center': Dimension(50, '%'),
-    'bottom': Dimension(100, '%'),
-    'right': Dimension(100, '%'),
+    'top': ZERO_PERCENT,
+    'left': ZERO_PERCENT,
+    'center': FIFTY_PERCENT,
+    'bottom': HUNDRED_PERCENT,
+    'right': HUNDRED_PERCENT,
 }
 
 
@@ -93,6 +98,7 @@ def validator(property_name=None, prefixed=False, unprefixed=False,
 
     """
     assert not (prefixed and unprefixed)
+
     def decorator(function):
         """Add ``function`` to the ``VALIDATORS``."""
         if property_name is None:
@@ -156,34 +162,76 @@ def single_token(function):
     return single_token_validator
 
 
+def comma_separated_list(function):
+    """Decorator for validators that accept a comma separated list."""
+    @functools.wraps(function)
+    def wrapper(tokens, *args):
+        results = []
+        for part in split_on_comma(tokens):
+            result = function(remove_whitespace(part), *args)
+            if result is None:
+                return None
+            results.append(result)
+        return results
+    wrapper.single_value = function
+    return wrapper
+
+
 def get_length(token, negative=True, percentage=False):
     if (token.unit in LENGTH_UNITS or (percentage and token.unit == '%')
-                or (token.type in ('INTEGER', 'NUMBER') and token.value == 0)
-            ) and (negative or token.value >= 0):
+            or (token.type in ('INTEGER', 'NUMBER')
+                and token.value == 0)) and (negative or token.value >= 0):
         return Dimension(token.value, token.unit)
+
+
+# http://dev.w3.org/csswg/css3-values/#angles
+# 1<unit> is this many radians.
+ANGLE_TO_RADIANS = {
+    'rad': 1,
+    'turn': 2 * math.pi,
+    'deg': math.pi / 180,
+    'grad': math.pi / 200,
+}
 
 
 def get_angle(token):
-    """Return whether the argument is an angle token."""
-    if token.unit in ANGLE_UNITS:
-        return Dimension(token.value, token.unit)
+    """Return the value in radians of an <angle> token, or None."""
+    factor = ANGLE_TO_RADIANS.get(token.unit)
+    if factor is not None:
+        return token.value * factor
+
+
+# http://dev.w3.org/csswg/css-values/#resolution
+RESOLUTION_TO_DPPX = {
+    'dppx': 1,
+    'dpi': 1 / computed_values.LENGTHS_TO_PIXELS['in'],
+    'dpcm': 1 / computed_values.LENGTHS_TO_PIXELS['cm'],
+}
+
+
+def get_resolution(token):
+    """Return the value in dppx of a <resolution> token, or None."""
+    factor = RESOLUTION_TO_DPPX.get(token.unit)
+    if factor is not None:
+        return token.value * factor
 
 
 def safe_urljoin(base_url, url):
     if url_is_absolute(url):
-        return url
+        return iri_to_uri(url)
     elif base_url:
-        return urljoin(base_url, url)
+        return iri_to_uri(urljoin(base_url, url))
     else:
         raise InvalidValues(
             'Relative URI reference without a base URI: %r' % url)
 
 
 @validator()
+@comma_separated_list
 @single_keyword
 def background_attachment(keyword):
     """``background-attachment`` property validation."""
-    return keyword in ('scroll', 'fixed')
+    return keyword in ('scroll', 'fixed', 'local')
 
 
 @validator('background-color')
@@ -194,6 +242,21 @@ def background_attachment(keyword):
 @single_token
 def other_colors(token):
     return parse_color(token)
+
+
+@validator()
+@single_token
+def outline_color(token):
+    if get_keyword(token) == 'invert':
+        return 'currentColor'
+    else:
+        return parse_color(token)
+
+
+@validator()
+@single_keyword
+def border_collapse(keyword):
+    return keyword in ('separate', 'collapse')
 
 
 @validator('color')
@@ -208,70 +271,240 @@ def color(token):
 
 
 @validator('background-image', wants_base_url=True)
+@comma_separated_list
+@single_token
+def background_image(token, base_url):
+    if token.type != 'FUNCTION':
+        return image_url([token], base_url)
+    arguments = split_on_comma(t for t in token.content if t.type != 'S')
+    name = token.function_name.lower()
+    if name in ('linear-gradient', 'repeating-linear-gradient'):
+        direction, color_stops = parse_linear_gradient_parameters(arguments)
+        if color_stops:
+            return 'linear-gradient', LinearGradient(
+                [parse_color_stop(stop) for stop in color_stops],
+                direction, 'repeating' in name)
+    elif name in ('radial-gradient', 'repeating-radial-gradient'):
+        result = parse_radial_gradient_parameters(arguments)
+        if result is not None:
+            shape, size, position, color_stops = result
+        else:
+            shape = 'ellipse'
+            size = 'keyword', 'farthest-corner'
+            position = 'left', FIFTY_PERCENT, 'top', FIFTY_PERCENT
+            color_stops = arguments
+        if color_stops:
+            return 'radial-gradient', RadialGradient(
+                [parse_color_stop(stop) for stop in color_stops],
+                shape, size, position, 'repeating' in name)
+
+
+DIRECTION_KEYWORDS = {
+    # ('angle', radians)  0 upwards, then clockwise
+    ('to', 'top'): ('angle', 0),
+    ('to', 'right'): ('angle', math.pi / 2),
+    ('to', 'bottom'): ('angle', math.pi),
+    ('to', 'left'): ('angle', math.pi * 3 / 2),
+    # ('corner', keyword)
+    ('to', 'top', 'left'): ('corner', 'top_left'),
+    ('to', 'left', 'top'): ('corner', 'top_left'),
+    ('to', 'top', 'right'): ('corner', 'top_right'),
+    ('to', 'right', 'top'): ('corner', 'top_right'),
+    ('to', 'bottom', 'left'): ('corner', 'bottom_left'),
+    ('to', 'left', 'bottom'): ('corner', 'bottom_left'),
+    ('to', 'bottom', 'right'): ('corner', 'bottom_right'),
+    ('to', 'right', 'bottom'): ('corner', 'bottom_right'),
+}
+
+
+def parse_linear_gradient_parameters(arguments):
+    first_arg = arguments[0]
+    if len(first_arg) == 1:
+        angle = get_angle(first_arg[0])
+        if angle is not None:
+            return ('angle', angle), arguments[1:]
+    else:
+        result = DIRECTION_KEYWORDS.get(tuple(map(get_keyword, first_arg)))
+        if result is not None:
+            return result, arguments[1:]
+    return ('angle', math.pi), arguments  # Default direction is 'to bottom'
+
+
+def parse_radial_gradient_parameters(arguments):
+    shape = None
+    position = None
+    size = None
+    size_shape = None
+    stack = arguments[0][::-1]
+    while stack:
+        token = stack.pop()
+        keyword = get_keyword(token)
+        if keyword == 'at':
+            position = background_position.single_value(stack[::-1])
+            if position is None:
+                return
+            break
+        elif keyword in ('circle', 'ellipse') and shape is None:
+            shape = keyword
+        elif keyword in ('closest-corner', 'farthest-corner',
+                         'closest-side', 'farthest-side') and size is None:
+            size = 'keyword', keyword
+        else:
+            if stack and size is None:
+                length_1 = get_length(token, percentage=True)
+                length_2 = get_length(stack[-1], percentage=True)
+                if None not in (length_1, length_2):
+                    size = 'explicit', (length_1, length_2)
+                    size_shape = 'ellipse'
+                    stack.pop()
+            if size is None:
+                length_1 = get_length(token)
+                if length_1 is not None:
+                    size = 'explicit', (length_1, length_1)
+                    size_shape = 'circle'
+            if size is None:
+                return
+    if (shape, size_shape) in (('circle', 'ellipse'), ('circle', 'ellipse')):
+        return
+    return (
+        shape or size_shape or 'ellipse',
+        size or ('keyword', 'farthest-corner'),
+        position or ('left', FIFTY_PERCENT, 'top', FIFTY_PERCENT),
+        arguments[1:])
+
+
+def parse_color_stop(tokens):
+    if len(tokens) == 1:
+        color = parse_color(tokens[0])
+        if color is not None:
+            return color, None
+    elif len(tokens) == 2:
+        color = parse_color(tokens[0])
+        position = get_length(tokens[1], negative=True, percentage=True)
+        if color is not None and position is not None:
+            return color, position
+    raise InvalidValues
+
+
 @validator('list-style-image', wants_base_url=True)
 @single_token
-def image(token, base_url):
+def image_url(token, base_url):
     """``*-image`` properties validation."""
     if get_keyword(token) == 'none':
-        return 'none'
+        return 'none', None
     if token.type == 'URI':
-        return safe_urljoin(base_url, token.value)
+        return 'url', safe_urljoin(base_url, token.value)
 
 
-@validator('transform-origin', unprefixed=True)
+class CenterKeywordFakeToken(object):
+    type = 'IDENT'
+    value = 'center'
+    unit = None
+
+
+@validator(unprefixed=True)
+def transform_origin(tokens):
+    # TODO: parse (and ignore) a third value for Z.
+    return simple_2d_position(tokens)
+
+
 @validator()
+@comma_separated_list
 def background_position(tokens):
     """``background-position`` property validation.
 
-    See http://www.w3.org/TR/CSS21/colors.html#propdef-background-position
+    See http://dev.w3.org/csswg/css3-background/#the-background-position
 
     """
-    if len(tokens) == 1:
-        center = BACKGROUND_POSITION_PERCENTAGES['center']
-        token = tokens[0]
-        keyword = get_keyword(token)
-        if keyword in BACKGROUND_POSITION_PERCENTAGES:
-            return BACKGROUND_POSITION_PERCENTAGES[keyword], center
+    result = simple_2d_position(tokens)
+    if result is not None:
+        pos_x, pos_y = result
+        return 'left', pos_x, 'top', pos_y
+
+    if len(tokens) == 4:
+        keyword_1 = get_keyword(tokens[0])
+        keyword_2 = get_keyword(tokens[2])
+        length_1 = get_length(tokens[1], percentage=True)
+        length_2 = get_length(tokens[3], percentage=True)
+        if length_1 and length_2:
+            if (keyword_1 in ('left', 'right') and
+                    keyword_2 in ('top', 'bottom')):
+                return keyword_1, length_1, keyword_2, length_2
+            if (keyword_2 in ('left', 'right') and
+                    keyword_1 in ('top', 'bottom')):
+                return keyword_2, length_2, keyword_1, length_1
+
+    if len(tokens) == 3:
+        length = get_length(tokens[2], percentage=True)
+        if length is not None:
+            keyword = get_keyword(tokens[1])
+            other_keyword = get_keyword(tokens[0])
         else:
-            length = get_length(token, percentage=True)
-            if length:
-                return length, center
+            length = get_length(tokens[1], percentage=True)
+            other_keyword = get_keyword(tokens[2])
+            keyword = get_keyword(tokens[0])
 
-    elif len(tokens) == 2:
-        token_1, token_2 = tokens
-        keyword_1, keyword_2 = map(get_keyword, tokens)
-        length_1 = get_length(token_1, percentage=True)
-        if length_1:
-            if keyword_2 in ('top', 'center', 'bottom'):
-                return length_1, BACKGROUND_POSITION_PERCENTAGES[keyword_2]
-            length_2 = get_length(token_2, percentage=True)
-            if length_2:
-                return length_1, length_2
-            raise InvalidValues
-        length_2 = get_length(token_2, percentage=True)
-        if length_2:
-            if keyword_1 in ('left', 'center', 'right'):
-                return BACKGROUND_POSITION_PERCENTAGES[keyword_1], length_2
-        elif (keyword_1 in ('left', 'center', 'right') and
-              keyword_2 in ('top', 'center', 'bottom')):
-            return (BACKGROUND_POSITION_PERCENTAGES[keyword_1],
-                    BACKGROUND_POSITION_PERCENTAGES[keyword_2])
-        elif (keyword_1 in ('top', 'center', 'bottom') and
-              keyword_2 in ('left', 'center', 'right')):
-            # Swap tokens. They need to be in (horizontal, vertical) order.
-            return (BACKGROUND_POSITION_PERCENTAGES[keyword_2],
-                    BACKGROUND_POSITION_PERCENTAGES[keyword_1])
-    #else: invalid
+        if length is not None:
+            if other_keyword == 'center':
+                if keyword in ('top', 'bottom'):
+                    return 'left', FIFTY_PERCENT, keyword, length
+                if keyword in ('left', 'right'):
+                    return keyword, length, 'top', FIFTY_PERCENT
+            elif (keyword in ('left', 'right') and
+                    other_keyword in ('top', 'bottom')):
+                return keyword, length, other_keyword, ZERO_PERCENT
+            elif (keyword in ('top', 'bottom') and
+                    other_keyword in ('left', 'right')):
+                return other_keyword, ZERO_PERCENT, keyword, length
+
+
+def simple_2d_position(tokens):
+    """Common syntax of background-position and transform-origin."""
+    if len(tokens) == 1:
+        tokens = [tokens[0], CenterKeywordFakeToken]
+    elif len(tokens) != 2:
+        return None
+
+    token_1, token_2 = tokens
+    length_1 = get_length(token_1, percentage=True)
+    length_2 = get_length(token_2, percentage=True)
+    if length_1 and length_2:
+        return length_1, length_2
+    keyword_1, keyword_2 = map(get_keyword, tokens)
+    if length_1 and keyword_2 in ('top', 'center', 'bottom'):
+        return length_1, BACKGROUND_POSITION_PERCENTAGES[keyword_2]
+    elif length_2 and keyword_1 in ('left', 'center', 'right'):
+            return BACKGROUND_POSITION_PERCENTAGES[keyword_1], length_2
+    elif (keyword_1 in ('left', 'center', 'right') and
+          keyword_2 in ('top', 'center', 'bottom')):
+        return (BACKGROUND_POSITION_PERCENTAGES[keyword_1],
+                BACKGROUND_POSITION_PERCENTAGES[keyword_2])
+    elif (keyword_1 in ('top', 'center', 'bottom') and
+          keyword_2 in ('left', 'center', 'right')):
+        # Swap tokens. They need to be in (horizontal, vertical) order.
+        return (BACKGROUND_POSITION_PERCENTAGES[keyword_2],
+                BACKGROUND_POSITION_PERCENTAGES[keyword_1])
 
 
 @validator()
-@single_keyword
-def background_repeat(keyword):
+@comma_separated_list
+def background_repeat(tokens):
     """``background-repeat`` property validation."""
-    return keyword in ('repeat', 'repeat-x', 'repeat-y', 'no-repeat')
+    keywords = tuple(map(get_keyword, tokens))
+    if keywords == ('repeat-x',):
+        return ('repeat', 'no-repeat')
+    if keywords == ('repeat-y',):
+        return ('no-repeat', 'repeat')
+    if keywords in (('no-repeat',), ('repeat',), ('space',), ('round',)):
+        return keywords * 2
+    if len(keywords) == 2 and all(
+            k in ('no-repeat', 'repeat', 'space', 'round')
+            for k in keywords):
+        return keywords
 
 
 @validator()
+@comma_separated_list
 def background_size(tokens):
     """Validation for ``background-size``."""
     if len(tokens) == 1:
@@ -281,24 +514,24 @@ def background_size(tokens):
             return keyword
         if keyword == 'auto':
             return ('auto', 'auto')
-        length = get_length(token, negative=False)
+        length = get_length(token, negative=False, percentage=True)
         if length:
             return (length, 'auto')
     elif len(tokens) == 2:
         values = []
         for token in tokens:
-            if get_keyword(token) == 'auto':
+            length = get_length(token, negative=False, percentage=True)
+            if length:
+                values.append(length)
+            elif get_keyword(token) == 'auto':
                 values.append('auto')
-            else:
-                length = get_length(token, negative=False)
-                if length:
-                    values.append(token)
         if len(values) == 2:
             return tuple(values)
 
 
 @validator('background-clip')
 @validator('background-origin')
+@comma_separated_list
 @single_keyword
 def box(keyword):
     """Validation for the ``<box>`` type used in ``background-clip``
@@ -317,6 +550,21 @@ def border_spacing(tokens):
             return tuple(lengths)
 
 
+@validator('border-top-right-radius')
+@validator('border-bottom-right-radius')
+@validator('border-bottom-left-radius')
+@validator('border-top-left-radius')
+def border_corner_radius(tokens):
+    """Validator for the `border-*-radius` properties."""
+    lengths = [
+        get_length(token, negative=False, percentage=True) for token in tokens]
+    if all(lengths):
+        if len(lengths) == 1:
+            return (lengths[0], lengths[0])
+        elif len(lengths) == 2:
+            return tuple(lengths)
+
+
 @validator('border-top-style')
 @validator('border-right-style')
 @validator('border-left-style')
@@ -328,10 +576,19 @@ def border_style(keyword):
                        'inset', 'outset', 'groove', 'ridge', 'solid')
 
 
+@validator('outline-style')
+@single_keyword
+def outline_style(keyword):
+    """``outline-style`` properties validation."""
+    return keyword in ('none', 'dotted', 'dashed', 'double', 'inset',
+                       'outset', 'groove', 'ridge', 'solid')
+
+
 @validator('border-top-width')
 @validator('border-right-width')
 @validator('border-left-width')
 @validator('border-bottom-width')
+@validator('outline-width')
 @single_token
 def border_width(token):
     """``border-*-width`` properties validation."""
@@ -416,7 +673,7 @@ def validate_content_token(base_url, token):
     if function:
         name, args = function
         prototype = (name, [a.type for a in args])
-        args = [a.value for a in args]
+        args = [getattr(a, 'value', a) for a in args]
         if prototype == ('attr', ['IDENT']):
             return (name, args[0])
         elif prototype in (('counter', ['IDENT']),
@@ -466,11 +723,11 @@ def counter(tokens, default_integer):
     assert token, 'got an empty token list'
     results = []
     while token is not None:
-        counter_name = get_keyword(token)
-        if counter_name is None:
+        if token.type != 'IDENT':
             return  # expected a keyword here
+        counter_name = token.value
         if counter_name in ('none', 'initial', 'inherit'):
-            raise InvalidValues('Invalid counter name: '+ counter_name)
+            raise InvalidValues('Invalid counter name: ' + counter_name)
         token = next(tokens, None)
         if token is not None and token.type == 'INTEGER':
             # Found an integer. Use it and get the next token
@@ -540,35 +797,27 @@ def float_(keyword):  # XXX do not hide the "float" builtin
 
 
 @validator()
+@comma_separated_list
 def font_family(tokens):
     """``font-family`` property validation."""
-    parts = split_on_comma(tokens)
-    families = []
-    for part in parts:
-        if len(part) == 1 and part[0].type == 'STRING':
-            families.append(part[0].value)
-        elif part and all(token.type == 'IDENT' for token in part):
-            families.append(' '.join(token.value for token in part))
-        else:
-            break
-    else:
-        return families
+    if len(tokens) == 1 and tokens[0].type == 'STRING':
+        return tokens[0].value
+    elif tokens and all(token.type == 'IDENT' for token in tokens):
+        return ' '.join(token.value for token in tokens)
 
 
 @validator()
 @single_token
 def font_size(token):
     """``font-size`` property validation."""
-    length = get_length(token, percentage=True)
+    length = get_length(token, negative=False, percentage=True)
     if length:
         return length
     font_size_keyword = get_keyword(token)
     if font_size_keyword in ('smaller', 'larger'):
         raise InvalidValues('value not supported yet')
-    if (
-        font_size_keyword in computed_values.FONT_SIZE_KEYWORDS #or
-        #keyword in ('smaller', 'larger')
-    ):
+    if font_size_keyword in computed_values.FONT_SIZE_KEYWORDS:
+        # or keyword in ('smaller', 'larger')
         return font_size_keyword
 
 
@@ -577,6 +826,16 @@ def font_size(token):
 def font_style(keyword):
     """``font-style`` property validation."""
     return keyword in ('normal', 'italic', 'oblique')
+
+
+@validator()
+@single_keyword
+def font_stretch(keyword):
+    """Validation for the ``font-stretch`` property."""
+    return keyword in (
+        'ultra-condensed', 'extra-condensed', 'condensed', 'semi-condensed',
+        'normal',
+        'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded')
 
 
 @validator()
@@ -596,6 +855,13 @@ def font_weight(token):
     if token.type == 'INTEGER':
         if token.value in [100, 200, 300, 400, 500, 600, 700, 800, 900]:
             return token.value
+
+
+@validator()
+@single_token
+def image_resolution(token):
+    # TODO: support 'snap' and 'from-image'
+    return get_resolution(token)
 
 
 @validator('letter-spacing')
@@ -727,7 +993,7 @@ def quotes(tokens):
     """``quotes`` property validation."""
     if (tokens and len(tokens) % 2 == 0
             and all(v.type == 'STRING' for v in tokens)):
-        strings = [v.value for v in tokens]
+        strings = [token.value for token in tokens]
         # Separate open and close quotes.
         # eg.  ['«', '»', '“', '”']  -> (['«', '“'], ['»', '”'])
         return strings[::2], strings[1::2]
@@ -807,6 +1073,13 @@ def white_space(keyword):
     return keyword in ('normal', 'pre', 'nowrap', 'pre-wrap', 'pre-line')
 
 
+@validator()
+@single_keyword
+def overflow_wrap(keyword):
+    """``overflow-wrap`` property validation."""
+    return keyword in ('normal', 'break-word')
+
+
 @validator(unprefixed=True)
 @single_keyword
 def image_rendering(keyword):
@@ -864,7 +1137,7 @@ def anchor(token):
     if function:
         name, args = function
         prototype = (name, [a.type for a in args])
-        args = [a.value for a in args]
+        args = [getattr(a, 'value', a) for a in args]
         if prototype == ('attr', ['IDENT']):
             return (name, args[0])
 
@@ -884,9 +1157,90 @@ def link(token, base_url):
     if function:
         name, args = function
         prototype = (name, [a.type for a in args])
-        args = [a.value for a in args]
+        args = [getattr(a, 'value', a) for a in args]
         if prototype == ('attr', ['IDENT']):
             return (name, args[0])
+
+
+@validator(prefixed=True)  # Non-standard
+@single_token
+def hyphens(token):
+    """Validation for ``hyphens``."""
+    keyword = get_keyword(token)
+    if keyword in ('none', 'manual', 'auto'):
+        return keyword
+
+
+@validator(prefixed=True)  # Non-standard
+@single_token
+def hyphenate_character(token):
+    """Validation for ``hyphenate-character``."""
+    keyword = get_keyword(token)
+    if keyword == 'auto':
+        return '‐'
+    elif token.type == 'STRING':
+        return token.value
+
+
+@validator(prefixed=True)  # Non-standard
+@single_token
+def hyphenate_limit_zone(token):
+    """Validation for ``hyphenate-limit-zone``."""
+    return get_length(token, negative=False, percentage=True)
+
+
+@validator(prefixed=True)  # Non-standard
+def hyphenate_limit_chars(tokens):
+    """Validation for ``hyphenate-limit-chars``."""
+    if len(tokens) == 1:
+        token, = tokens
+        keyword = get_keyword(token)
+        if keyword == 'auto':
+            return (5, 2, 2)
+        elif token.type == 'INTEGER':
+            return (token.value, 2, 2)
+    elif len(tokens) == 2:
+        total, left = tokens
+        total_keyword = get_keyword(total)
+        left_keyword = get_keyword(left)
+        if total.type == 'INTEGER':
+            if left.type == 'INTEGER':
+                return (total.value, left.value, left.value)
+            elif left_keyword == 'auto':
+                return (total.value, 2, 2)
+        elif total_keyword == 'auto':
+            if left.type == 'INTEGER':
+                return (5, left.value, left.value)
+            elif left_keyword == 'auto':
+                return (5, 2, 2)
+    elif len(tokens) == 3:
+        total, left, right = tokens
+        if (
+            (get_keyword(total) == 'auto' or total.type == 'INTEGER') and
+            (get_keyword(left) == 'auto' or left.type == 'INTEGER') and
+            (get_keyword(right) == 'auto' or right.type == 'INTEGER')
+        ):
+            total = total.value if total.type == 'INTEGER' else 5
+            left = left.value if left.type == 'INTEGER' else 2
+            right = right.value if right.type == 'INTEGER' else 2
+            return (total, left, right)
+
+
+@validator(prefixed=True)  # Non-standard
+@single_token
+def lang(token):
+    """Validation for ``lang``."""
+    if get_keyword(token) == 'none':
+        return 'none'
+    function = parse_function(token)
+    if function:
+        name, args = function
+        prototype = (name, [a.type for a in args])
+        args = [getattr(a, 'value', a) for a in args]
+        if prototype == ('attr', ['IDENT']):
+            return (name, args[0])
+    elif token.type == 'STRING':
+        return ('string', token.value)
 
 
 @validator(prefixed=True)  # CSS3 GCPM, experimental
@@ -1003,6 +1357,47 @@ def expand_four_sides(base_url, name, tokens):
         yield result
 
 
+@expander('border-radius')
+def border_radius(base_url, name, tokens):
+    """Validator for the `border-radius` property."""
+    current = horizontal = []
+    vertical = []
+    for token in tokens:
+        if token.type == 'DELIM' and token.value == '/':
+            if current is horizontal:
+                if token == tokens[-1]:
+                    raise InvalidValues('Expected value after "/" separator')
+                else:
+                    current = vertical
+            else:
+                raise InvalidValues('Expected only one "/" separator')
+        else:
+            current.append(token)
+
+    if not vertical:
+        vertical = horizontal[:]
+
+    for values in horizontal, vertical:
+        # Make sure we have 4 tokens
+        if len(values) == 1:
+            values *= 4
+        elif len(values) == 2:
+            values *= 2  # (br, bl) defaults to (tl, tr)
+        elif len(values) == 3:
+            values.append(values[1])  # bl defaults to tr
+        elif len(values) != 4:
+            raise InvalidValues(
+                'Expected 1 to 4 token components got %i' % len(values))
+    corners = ('top-left', 'top-right', 'bottom-right', 'bottom-left')
+    for corner, tokens in zip(corners, zip(horizontal, vertical)):
+        new_name = 'border-%s-radius' % corner
+        # validate_non_shorthand returns [(name, value)], we want
+        # to yield (name, value)
+        result, = validate_non_shorthand(
+            base_url, new_name, tokens, required=True)
+        yield result
+
+
 def generic_expander(*expanded_names, **kwargs):
     """Decorator helping expanders to handle ``inherit`` and ``initial``.
 
@@ -1013,6 +1408,7 @@ def generic_expander(*expanded_names, **kwargs):
     """
     wants_base_url = kwargs.pop('wants_base_url', False)
     assert not kwargs
+
     def generic_expander_decorator(wrapped):
         """Decorate the ``wrapped`` expander."""
         @functools.wraps(wrapped)
@@ -1051,7 +1447,7 @@ def generic_expander(*expanded_names, **kwargs):
                         (actual_new_name, value), = validate_non_shorthand(
                             base_url, actual_new_name, value, required=True)
                 else:
-                    value = INITIAL_VALUES[actual_new_name.replace('-', '_')]
+                    value = 'initial'
 
                 yield actual_new_name, value
         return generic_expander_wrapper
@@ -1081,7 +1477,7 @@ def expand_list_style(name, tokens, base_url):
             type_specified = True
         elif list_style_position([token]) is not None:
             suffix = '-position'
-        elif image([token], base_url) is not None:
+        elif image_url([token], base_url) is not None:
             suffix = '-image'
             image_specified = True
         else:
@@ -1117,6 +1513,7 @@ def expand_border(base_url, name, tokens):
 @expander('border-right')
 @expander('border-bottom')
 @expander('border-left')
+@expander('outline')
 @generic_expander('-width', '-color', '-style')
 def expand_border_side(name, tokens):
     """Expand the ``border-*`` shorthand properties.
@@ -1137,46 +1534,100 @@ def expand_border_side(name, tokens):
 
 
 @expander('background')
-@generic_expander('-color', '-image', '-repeat', '-attachment', '-position',
-                  wants_base_url=True)
-def expand_background(name, tokens, base_url):
+def expand_background(base_url, name, tokens):
     """Expand the ``background`` shorthand property.
 
-    See http://www.w3.org/TR/CSS21/colors.html#propdef-background
+    See http://dev.w3.org/csswg/css3-background/#the-background
 
     """
-    # Make `tokens` a stack
-    tokens = list(reversed(tokens))
-    while tokens:
-        token = tokens.pop()
-        if parse_color(token) is not None:
-            suffix = '-color'
-        elif image([token], base_url) is not None:
-            suffix = '-image'
-        elif background_repeat([token]) is not None:
-            suffix = '-repeat'
-        elif background_attachment([token]) is not None:
-            suffix = '-attachment'
-        elif background_position([token]):
-            if tokens:
-                next_token = tokens.pop()
-                if background_position([token, next_token]):
-                    # Two consecutive '-position' tokens, yield them together
-                    yield '-position', [token, next_token]
-                    continue
+    properties = [
+        'background_color', 'background_image', 'background_repeat',
+        'background_attachment', 'background_position', 'background_size',
+        'background_clip', 'background_origin']
+    keyword = get_single_keyword(tokens)
+    if keyword in ('initial', 'inherit'):
+        for name in properties:
+            yield name, keyword
+        return
+
+    def parse_layer(tokens, final_layer=False):
+        results = {}
+
+        def add(name, value):
+            if value is None:
+                return False
+            name = 'background_' + name
+            if name in results:
+                raise InvalidValues
+            results[name] = value
+            return True
+
+        # Make `tokens` a stack
+        tokens = tokens[::-1]
+        while tokens:
+            if add('repeat',
+                   background_repeat.single_value(tokens[-2:][::-1])):
+                del tokens[-2:]
+                continue
+            token = tokens[-1:]
+            if (
+                (final_layer and add('color', other_colors(token)))
+                or add('image', background_image.single_value(token, base_url))
+                or add('repeat', background_repeat.single_value(token))
+                or add('attachment', background_attachment.single_value(token))
+            ):
+                tokens.pop()
+                continue
+            for n in (4, 3, 2, 1)[-len(tokens):]:
+                n_tokens = tokens[-n:][::-1]
+                position = background_position.single_value(n_tokens)
+                if position is not None:
+                    assert add('position', position)
+                    del tokens[-n:]
+                    if (tokens and tokens[-1].type == 'DELIM'
+                            and tokens[-1].value == '/'):
+                        for n in (3, 2)[-len(tokens):]:
+                            # n includes the '/' delimiter.
+                            n_tokens = tokens[-n:-1][::-1]
+                            size = background_size.single_value(n_tokens)
+                            if size is not None:
+                                assert add('size', size)
+                                del tokens[-n:]
+                    break
+            if position is not None:
+                continue
+            if add('origin', box.single_value(token)):
+                tokens.pop()
+                next_token = tokens[-1:]
+                if add('clip', box.single_value(next_token)):
+                    tokens.pop()
                 else:
-                    # The next token is not a '-position', put it back
-                    # for the next loop iteration
-                    tokens.append(next_token)
-            # A single '-position' token
-            suffix = '-position'
-        else:
+                    # The same keyword sets both:
+                    assert add('clip', box.single_value(token))
+                continue
             raise InvalidValues
-        yield suffix, [token]
+
+        color = results.pop(
+            'background_color', INITIAL_VALUES['background_color'])
+        for name in properties:
+            if name not in results:
+                results[name] = INITIAL_VALUES[name][0]
+        return color, results
+
+    layers = reversed(split_on_comma(tokens))
+    color, last_layer = parse_layer(next(layers), final_layer=True)
+    results = dict((k, [v]) for k, v in last_layer.items())
+    for tokens in layers:
+        _, layer = parse_layer(tokens)
+        for name, value in layer.items():
+            results[name].append(value)
+    for name, values in results.items():
+        yield name, values[::-1]  # "Un-reverse"
+    yield 'background-color', color
 
 
 @expander('font')
-@generic_expander('-style', '-variant', '-weight', '-size',
+@generic_expander('-style', '-variant', '-weight', '-stretch', '-size',
                   'line-height', '-family')  # line-height is not a suffix
 def expand_font(name, tokens):
     """Expand the ``font`` shorthand property.
@@ -1206,6 +1657,8 @@ def expand_font(name, tokens):
             suffix = '-variant'
         elif font_weight([token]) is not None:
             suffix = '-weight'
+        elif font_stretch([token]) is not None:
+            suffix = '-stretch'
         else:
             # We’re done with these three, continue with font-size
             break
@@ -1237,6 +1690,20 @@ def expand_font(name, tokens):
     if font_family(tokens) is None:
         raise InvalidValues
     yield '-family', tokens
+
+
+@expander('word-wrap')
+def expand_word_wrap(base_url, name, tokens):
+    """Expand the ``word-wrap`` legacy property.
+
+    See http://http://www.w3.org/TR/css3-text/#overflow-wrap
+
+    """
+    keyword = overflow_wrap(tokens)
+    if keyword is None:
+        raise InvalidValues
+
+    yield 'overflow-wrap', keyword
 
 
 def validate_non_shorthand(base_url, name, tokens, required=False):
@@ -1275,7 +1742,8 @@ def preprocess_declarations(base_url, declarations):
 
     """
     def validation_error(level, reason):
-        getattr(LOGGER, level)('Ignored `%s: %s` at %i:%i, %s.',
+        getattr(LOGGER, level)(
+            'Ignored `%s: %s` at %i:%i, %s.',
             declaration.name, declaration.value.as_css(),
             declaration.line, declaration.column, reason)
 
@@ -1283,20 +1751,22 @@ def preprocess_declarations(base_url, declarations):
         name = declaration.name
 
         if name in PREFIXED and not name.startswith(PREFIX):
-            validation_error('warn',
+            validation_error(
+                'warning',
                 'the property is experimental or non-standard, use '
                 + PREFIX + name)
             continue
 
         if name in NOT_PRINT_MEDIA:
-            validation_error('info',
-                'the property does not apply for the print media')
+            validation_error(
+                'info', 'the property does not apply for the print media')
             continue
 
         if name.startswith(PREFIX):
             unprefixed_name = name[len(PREFIX):]
             if unprefixed_name in UNPREFIXED:
-                validation_error('warn',
+                validation_error(
+                    'warning',
                     'the property was unprefixed, use ' + unprefixed_name)
                 continue
             if unprefixed_name in PREFIXED:
@@ -1308,7 +1778,8 @@ def preprocess_declarations(base_url, declarations):
             # Use list() to consume generators now and catch any error.
             result = list(expander_(base_url, name, tokens))
         except InvalidValues as exc:
-            validation_error('warn',
+            validation_error(
+                'warning',
                 exc.args[0] if exc.args and exc.args[0] else 'invalid value')
             continue
 

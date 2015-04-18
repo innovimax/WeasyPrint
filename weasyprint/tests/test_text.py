@@ -5,14 +5,12 @@
 
     Test the text layout.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
-
-import cairo
 
 from ..css import StyleDict
 from ..css.properties import INITIAL_VALUES
@@ -21,24 +19,29 @@ from .test_layout import parse, body_children
 from .testing_utils import FONTS, assert_no_logs
 
 
+FONTS = FONTS.split(', ')
+
+
 def make_text(text, width=None, **style):
     """Wrapper for split_first_line() creating a StyleDict."""
     style = StyleDict({
-        'font_family': 'Nimbus Mono L, Liberation Mono, FreeMono, Monospace',
+        'font_family': ['Nimbus Mono L', 'Liberation Mono', 'FreeMono',
+                        'monospace'],
     }, INITIAL_VALUES).updated_copy(style)
-    return split_first_line(text, style, hinting=False, max_width=width)
+    return split_first_line(
+        text, style, hinting=False, max_width=width, line_width=None)
 
 
 @assert_no_logs
 def test_line_content():
     """Test the line break for various fixed-width lines."""
-    for width, remaining in [(120, 'text for test'),
+    for width, remaining in [(100, 'text for test'),
                              (45, 'is a text for test')]:
         text = 'This is a text for test'
         _, length, resume_at, _, _, _ = make_text(
             text, width, font_family=FONTS, font_size=19)
         assert text[resume_at:] == remaining
-        assert length == resume_at
+        assert length + 1 == resume_at  # +1 is for the removed trailing space
 
 
 @assert_no_logs
@@ -61,7 +64,7 @@ def test_line_breaking():
     _, _, resume_at, _, _, _ = make_text(string, 90, font_size=100)
     assert string[resume_at:] == 'is a text for test'
 
-    _, _, resume_at, _, _, _ = make_text(string, 120, font_family=FONTS,
+    _, _, resume_at, _, _, _ = make_text(string, 100, font_family=FONTS,
                                          font_size=19)
     assert string[resume_at:] == 'text for test'
 
@@ -86,8 +89,34 @@ def test_text_font_size_zero():
         <p>test font size zero</p>
     ''')
     paragraph, = body_children(page)
-    # zero-sized text boxes are removed
     line, = paragraph.children
+    # zero-sized text boxes are removed
     assert not line.children
     assert line.height == 0
     assert paragraph.height == 0
+
+
+@assert_no_logs
+def test_text_spaced_inlines():
+    """Test a text with inlines separated by a space."""
+    page, = parse('''
+        <p>start <i><b>bi1</b> <b>bi2</b></i> <b>b1</b> end</p>
+    ''')
+    paragraph, = body_children(page)
+    line, = paragraph.children
+    start, i, space, b, end = line.children
+    assert start.text == 'start '
+    assert space.text == ' '
+    assert space.width > 0
+    assert end.text == ' end'
+
+    bi1, space, bi2 = i.children
+    bi1, = bi1.children
+    bi2, = bi2.children
+    assert bi1.text == 'bi1'
+    assert space.text == ' '
+    assert space.width > 0
+    assert bi2.text == 'bi2'
+
+    b1, = b.children
+    assert b1.text == 'b1'

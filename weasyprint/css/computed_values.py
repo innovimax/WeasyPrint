@@ -6,14 +6,12 @@
     Convert *specified* property values (the result of the cascade and
     inhertance) into *computed* values (that are inherited).
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
-
-import math
 
 from .properties import INITIAL_VALUES, Dimension
 from ..urls import get_link_attribute
@@ -34,14 +32,6 @@ LENGTHS_TO_PIXELS = {
     'mm': 96. / 25.4,  # LENGTHS_TO_PIXELS['in'] / 25.4
 }
 
-# http://dev.w3.org/csswg/css3-values/#angles
-# How many radians is one <unit>?
-ANGLE_TO_RADIANS = {
-    'rad': 1,
-    'turn': 2 * math.pi,
-    'deg': math.pi / 180,
-    'grad': math.pi / 200,
-}
 
 # Value in pixels of font-size for <absolute-size> keywords: 12pt (16px) for
 # medium, and scaling factors given in CSS3 for others:
@@ -143,7 +133,9 @@ INITIAL_VALUES['size'] = tuple(
 
 def _computing_order():
     """Some computed values are required by others, so order matters."""
-    first = ['font_size', 'line_height', 'color']
+    first = [
+        'font_stretch', 'font_weight', 'font_family', 'font_variant',
+        'font_style', 'font_size', 'line_height']
     order = sorted(INITIAL_VALUES)
     for name in first:
         order.remove(name)
@@ -157,6 +149,7 @@ COMPUTER_FUNCTIONS = {}
 def register_computer(name):
     """Decorator registering a property ``name`` for a function."""
     name = name.replace('-', '_')
+
     def decorator(function):
         """Register the property ``name`` for ``function``."""
         COMPUTER_FUNCTIONS[name] = function
@@ -211,21 +204,32 @@ def compute(element, pseudo_type, specified, computed, parent_style):
 # it is useless.
 # pylint: disable=W0613
 
-@register_computer('background-color')
-@register_computer('border-top-color')
-@register_computer('border-right-color')
-@register_computer('border-bottom-color')
-@register_computer('border-left-color')
-def other_color(computer, name, value):
-    """Compute the ``*-color`` properties."""
-    if value == 'currentColor':
-        return computer.computed.color
-    else:
-        # As specified
-        return value
+
+@register_computer('background-image')
+def background_image(computer, name, values):
+    """Compute lenghts in gradient background-image."""
+    for type_, value in values:
+        if type_ in ('linear-gradient', 'radial-gradient'):
+            value.stop_positions = [
+                length(computer, name, pos) if pos is not None else None
+                for pos in value.stop_positions]
+        if type_ == 'radial-gradient':
+            value.center, = background_position(computer, name, [value.center])
+            if value.size_type == 'explicit':
+                value.size = length_or_percentage_tuple(
+                    computer, name, value.size)
+    return values
 
 
 @register_computer('background-position')
+def background_position(computer, name, values):
+    """Compute lengths in background-position."""
+    return [
+        (origin_x, length(computer, name, pos_x),
+         origin_y, length(computer, name, pos_y))
+        for origin_x, pos_x, origin_y, pos_y in values]
+
+
 @register_computer('transform-origin')
 def length_or_percentage_tuple(computer, name, values):
     """Compute the lists of lengths that can be percentages."""
@@ -260,6 +264,7 @@ def length_tuple(computer, name, values):
 @register_computer('padding-bottom')
 @register_computer('padding-left')
 @register_computer('text-indent')
+@register_computer('hyphenate-limit-zone')
 def length(computer, name, value, font_size=None, pixels_only=False):
     """Compute a length ``value``."""
     if value == 'auto':
@@ -272,21 +277,28 @@ def length(computer, name, value, font_size=None, pixels_only=False):
         return value.value if pixels_only else value
     elif unit in LENGTHS_TO_PIXELS:
         # Convert absolute lengths to pixels
-        factor = LENGTHS_TO_PIXELS[unit]
-    elif unit in ('em', 'ex'):
+        result = value.value * LENGTHS_TO_PIXELS[unit]
+    elif unit in ('em', 'ex', 'ch'):
         if font_size is None:
-            factor = computer.computed.font_size
-        else:
-            factor = font_size
-        if unit == 'ex':
-            # TODO: find a better way to measure ex, see
-            # http://www.w3.org/TR/CSS21/syndata.html#length-units
-            factor *= 0.5
+            font_size = computer.computed.font_size
+        if unit in ('ex', 'ch'):
+            # TODO: cache
+            if unit == 'ex':
+                result = value.value * font_size * ex_ratio(computer.computed)
+            elif unit == 'ch':
+                layout = text.Layout(
+                    hinting=False, font_size=font_size,
+                    style=computer.computed)
+                layout.set_text('0')
+                line, = layout.iter_lines()
+                logical_width, _ = text.get_size(line)
+                result = value.value * logical_width
+        elif unit == 'em':
+            result = value.value * font_size
     else:
         # A percentage or 'auto': no conversion needed.
         return value
 
-    result = value.value * factor
     return result if pixels_only else Dimension(result, 'px')
 
 
@@ -299,18 +311,18 @@ def pixel_length(computer, name, value):
 
 
 @register_computer('background-size')
-def background_size(computer, name, value):
+def background_size(computer, name, values):
     """Compute the ``background-size`` properties."""
-    if value in ('contain', 'cover'):
-        return value
-    else:
-        return length_or_percentage_tuple(computer, name, value)
+    return [value if value in ('contain', 'cover') else
+            length_or_percentage_tuple(computer, name, value)
+            for value in values]
 
 
 @register_computer('border-top-width')
 @register_computer('border-right-width')
 @register_computer('border-left-width')
 @register_computer('border-bottom-width')
+@register_computer('outline-width')
 def border_width(computer, name, value):
     """Compute the ``border-*-width`` properties."""
     style = computer.computed[name.replace('width', 'style')]
@@ -326,6 +338,15 @@ def border_width(computer, name, value):
         return value
 
     return length(computer, name, value, pixels_only=True)
+
+
+@register_computer('border-top-left-radius')
+@register_computer('border-top-right-radius')
+@register_computer('border-bottom-left-radius')
+@register_computer('border-bottom-right-radius')
+def border_radius(computer, name, values):
+    """Compute the ``border-*-radius`` properties."""
+    return [length(computer, name, value) for value in values]
 
 
 @register_computer('content')
@@ -441,14 +462,25 @@ def link(computer, name, values):
             return values
 
 
+@register_computer('lang')
+def lang(computer, name, values):
+    """Compute the ``lang`` property."""
+    if values == 'none':
+        return None
+    else:
+        type_, key = values
+        if type_ == 'attr':
+            return computer.element.get(key) or None
+        elif type_ == 'string':
+            return key
+
+
 @register_computer('transform')
 def transform(computer, name, value):
     """Compute the ``transform`` property."""
     result = []
     for function, args in value:
-        if function in ('rotate', 'skewx', 'skewy'):
-            args = args.value * ANGLE_TO_RADIANS[args.unit]
-        elif function == 'translate':
+        if function == 'translate':
             args = length_or_percentage_tuple(computer, name, args)
         result.append((function, args))
     return result
@@ -482,7 +514,7 @@ def word_spacing(computer, name, value):
         return length(computer, name, value, pixels_only=True)
 
 
-def strut_layout(style):
+def strut_layout(style, hinting=True):
     """Return a tuple of the used value of ``line-height`` and the baseline.
 
     The baseline is given from the top edge of line height.
@@ -495,10 +527,22 @@ def strut_layout(style):
     else:
         # TODO: get the real value for `hinting`? (if we really care…)
         _, _, _, _, pango_height, baseline = text.split_first_line(
-            '', style, hinting=True, max_width=None)
+            '', style, hinting=hinting, max_width=None, line_width=None)
     if line_height == 'normal':
         return pango_height, baseline
     type_, value = line_height
     if type_ == 'NUMBER':
         value *= style.font_size
     return value, baseline + (value - pango_height) / 2
+
+
+def ex_ratio(style):
+    """Return the ratio 1ex/font_size, according to given style."""
+    font_size = 1000  # big value
+    layout = text.Layout(hinting=False, font_size=font_size, style=style)
+    layout.set_text('x')
+    line, = layout.iter_lines()
+    _, ink_height_above_baseline = text.get_ink_position(line)
+    # Zero means some kind of failure, fallback is 0.5.
+    # We round to try keeping exact values that were altered by Pango.
+    return round(-ink_height_above_baseline / font_size, 5) or 0.5

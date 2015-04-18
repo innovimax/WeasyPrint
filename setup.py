@@ -5,37 +5,39 @@
 
     WeasyPrint converts web documents to PDF.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 import re
 import sys
+import codecs
 from os import path
 from setuptools import setup, find_packages
 
-with open(path.join(path.dirname(__file__), 'weasyprint', '__init__.py')) as fd:
-    VERSION = re.search("VERSION = '([^']+)'", fd.read().strip()).group(1)
+VERSION = re.search("VERSION = '([^']+)'", codecs.open(
+    path.join(path.dirname(__file__), 'weasyprint', '__init__.py'),
+    encoding="utf-8",
+).read().strip()).group(1)
 
-with open(path.join(path.dirname(__file__), 'README')) as fd:
-    LONG_DESCRIPTION = fd.read()
+LONG_DESCRIPTION = open(path.join(path.dirname(__file__), 'README')).read()
 
 
 REQUIREMENTS = [
-        # Keep this in sync with the "install" documentation
-        'lxml',
-        'pystacia',
-        'tinycss>=0.2',
-        'cssselect>=0.6',
-        'CairoSVG>=0.4.1',
-        # Not installable by pip:
-        #  Pango>=1.29.3
-        #  PyGObject
-        #  PyCairo
+    # XXX: Keep this in sync with docs/install.rst
+    'lxml>=3.0',
+    'html5lib>=0.999',
+    'tinycss==0.3',
+    'cssselect>=0.6',
+    'CairoSVG>=0.4.1',
+    'cffi>=0.6',
+    'cairocffi>=0.5',
+    'Pyphen>=0.8'
+    # C dependencies: Gdk-Pixbuf (optional), Pango, cairo.
 ]
 if sys.version_info < (2, 7) or (3,) <= sys.version_info < (3, 2):
-    # In the stdlib from 2.7:
+    # In the stdlib from 2.7 and 3.2:
     REQUIREMENTS.append('argparse')
 
 setup(
@@ -56,6 +58,8 @@ setup(
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.2',
+        'Programming Language :: Python :: 3.3',
+        'Programming Language :: Python :: 3.4',
         'Topic :: Internet :: WWW/HTTP',
         'Topic :: Text Processing :: Markup :: HTML',
         'Topic :: Multimedia :: Graphics :: Graphics Conversion',
@@ -63,6 +67,7 @@ setup(
     ],
     packages=find_packages(),
     package_data={
+        'weasyprint.hyphenation': ['*.dic'],
         'weasyprint.tests': ['resources/*.*', 'resources/*/*'],
         'weasyprint.css': ['*.css']},
     zip_safe=False,

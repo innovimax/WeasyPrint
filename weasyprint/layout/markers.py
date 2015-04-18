@@ -5,21 +5,20 @@
 
     Layout for list markers (for ``display: list-item``).
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
 
-import cairo
-
 from .percentages import resolve_percentages
+from .replaced import image_marker_layout
 from ..text import split_first_line
 from ..formatting_structure import boxes
 
 
-def list_marker_layout(document, box):
+def list_marker_layout(context, box):
     """Lay out the list markers of ``box``."""
     # List markers can be either 'inside' or 'outside'.
     # Inside markers are layed out just like normal inline content, but
@@ -32,8 +31,8 @@ def list_marker_layout(document, box):
         if isinstance(marker, boxes.TextBox):
             (marker.pango_layout, _, _, marker.width, marker.height,
                 marker.baseline) = split_first_line(
-                    marker.text, marker.style, document.enable_hinting,
-                    max_width=None)
+                    marker.text, marker.style, context.enable_hinting,
+                    max_width=None, line_width=None)
         else:
             # Image marker
             image_marker_layout(marker)
@@ -54,35 +53,3 @@ def list_marker_layout(document, box):
         else:
             marker.margin_left = half_em
             marker.position_x += box.border_width()
-
-
-def image_marker_layout(box):
-    """Layout the :class:`boxes.ImageMarkerBox` ``box``.
-
-    :class:`boxes.ImageMarkerBox` objects are :class:`boxes.ReplacedBox`
-    objects, but their used size is computed differently.
-
-    """
-    image, width, height = box.replacement
-    ratio = width / height
-    one_em = box.style.font_size
-    if width is not None and height is not None:
-        box.width = width
-        box.height = height
-    elif width is not None and ratio is not None:
-        box.width = width
-        box.height = width / ratio
-    elif height is not None and ratio is not None:
-        box.width = height * ratio
-        box.height = height
-    elif ratio is not None:
-        # ratio >= 1 : width >= height
-        if ratio >= 1:
-            box.width = one_em
-            box.height = one_em / ratio
-        else:
-            box.width = one_em * ratio
-            box.height = one_em
-    else:
-        box.width = width if width is not None else one_em
-        box.height = height if height is not None else one_em

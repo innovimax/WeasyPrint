@@ -5,7 +5,7 @@
 
     A WeasyPrint-based web browser. In your web browser.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
@@ -13,16 +13,11 @@
 # Do NOT import unicode_literals here. Raw WSGI requires native strings.
 from __future__ import division
 
-import io
 import os.path
-import base64
-
-import cairo
 
 from weasyprint import HTML, CSS
-from weasyprint.formatting_structure import boxes
 from weasyprint.urls import url_is_absolute
-from weasyprint.compat import izip, parse_qs
+from weasyprint.compat import parse_qs, base64_encode, iteritems
 
 
 FAVICON = os.path.join(os.path.dirname(__file__),
@@ -33,37 +28,13 @@ STYLESHEET = CSS(string='''
 ''')
 
 
-def find_links(box, links, anchors):
-    link = box.style.link
-    # 'link' is inherited but redundant on text boxes
-    if link and not isinstance(box, boxes.TextBox):
-        type_, href = box.style.link
-        if type_ == 'internal':
-            href = '#' + href
-        else:
-            href = '/view/' + href
-        # "Border area.  That's the area that hit-testing is done on."
-        # http://lists.w3.org/Archives/Public/www-style/2012Jun/0318.html
-        links.append((href,) + box.hit_area())
-
-    anchor = box.style.anchor
-    if anchor:
-        anchors.append((anchor,) + box.hit_area())
-
-    if isinstance(box, boxes.ParentBox):
-        for child in box.children:
-            find_links(child, links, anchors)
-
-
 def get_pages(html):
-    document, png_pages = html.get_png_pages([STYLESHEET], _with_document=True)
-    for page, (width, height, png_bytes) in izip(document.pages, png_pages):
-        links = []
-        anchors = []
-        find_links(page, links, anchors)
+    document = html.render(enable_hinting=True, stylesheets=[STYLESHEET])
+    for page in document.pages:
+        png_bytes, width, height = document.copy([page]).write_png()
         data_url = 'data:image/png;base64,' + (
-            base64.encodestring(png_bytes).decode('ascii').replace('\n', ''))
-        yield width, height, data_url, links, anchors
+            base64_encode(png_bytes).decode('ascii').replace('\n', ''))
+        yield width, height, data_url, page.links, page.anchors
 
 
 def render_template(url):
@@ -104,15 +75,17 @@ def render_template(url):
         for width, height, data_url, links, anchors in get_pages(html):
             write('<section style="width: {0}px; height: {1}px">\n'
                   '  <img src="{2}">\n'.format(width, height, data_url))
-            for href, pos_x, pos_y, width, height in links:
+            for link_type, target, (pos_x, pos_y, width, height) in links:
+                href = ('#' + target if link_type == 'internal'
+                        else '/view/' + target)
                 write('  <a style="left: {0}px; top: {1}px; '
                       'width: {2}px; height: {3}px" href="{4}"></a>\n'
                       .format(pos_x, pos_y, width, height, href))
-            for anchor, pos_x, pos_y, width, height in anchors:
+            for anchor_name, (pos_x, pos_y) in iteritems(anchors):
                 # Remove 60px to pos_y so that the real pos is below
                 # the address bar.
                 write('  <a style="left: {0}px; top: {1}px;" name="{2}"></a>\n'
-                      .format(pos_x, pos_y - 60, anchor))
+                      .format(pos_x, pos_y - 60, anchor_name))
             write('</section>\n')
     else:
         write('''
@@ -156,11 +129,12 @@ def app(environ, start_response):
         with open(FAVICON, 'rb') as fd:
             return make_response(fd.read(), content_type='image/x-icon')
 
-    elif path.startswith('/pdf/') and len(path) > 5: # len('/pdf/') == 5
+    elif path.startswith('/pdf/') and len(path) > 5:  # len('/pdf/') == 5
         url = normalize_url(path[5:], environ.get('QUERY_STRING'))
         body = HTML(url=url).write_pdf(stylesheets=[STYLESHEET])
         filename = url.rstrip('/').rsplit('/', 1)[-1] or 'out'
-        return make_response(body, content_type='application/pdf',
+        return make_response(
+            body, content_type='application/pdf',
             headers=[('Content-Disposition',
                       'attachement; filename=%s.pdf' % filename)])
 

@@ -5,7 +5,7 @@
 
     Line breaking and layout for inline-level boxes.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
@@ -14,17 +14,18 @@ from __future__ import division, unicode_literals
 
 from .absolute import absolute_layout, AbsolutePlaceholder
 from .float import avoid_collisions, float_layout
-from .markers import image_marker_layout
+from .replaced import image_marker_layout
 from .min_max import handle_min_max_width, handle_min_max_height
 from .percentages import resolve_percentages, resolve_one_percentage
-from .preferred import shrink_to_fit, inline_preferred_minimum_width
+from .preferred import (shrink_to_fit, inline_preferred_minimum_width,
+                        trailing_whitespace_size)
 from .tables import find_in_flow_baseline, table_wrapper_width
 from ..text import split_first_line
 from ..formatting_structure import boxes
-from ..css.computed_values import strut_layout
+from ..css.computed_values import strut_layout, ex_ratio
 
 
-def iter_line_boxes(document, box, position_y, skip_stack, containing_block,
+def iter_line_boxes(context, box, position_y, skip_stack, containing_block,
                     device_size, absolute_boxes, fixed_boxes):
     """Return an iterator of ``(line, resume_at)``.
 
@@ -43,7 +44,7 @@ def iter_line_boxes(document, box, position_y, skip_stack, containing_block,
     """
     while 1:
         line, resume_at = get_next_linebox(
-            document, box, position_y, skip_stack, containing_block,
+            context, box, position_y, skip_stack, containing_block,
             device_size, absolute_boxes, fixed_boxes)
         if line:
             position_y = line.position_y + line.height
@@ -55,7 +56,7 @@ def iter_line_boxes(document, box, position_y, skip_stack, containing_block,
         skip_stack = resume_at
 
 
-def get_next_linebox(document, linebox, position_y, skip_stack,
+def get_next_linebox(context, linebox, position_y, skip_stack,
                      containing_block, device_size, absolute_boxes,
                      fixed_boxes):
     """Return ``(line, resume_at)``."""
@@ -72,15 +73,15 @@ def get_next_linebox(document, linebox, position_y, skip_stack,
         return None, None
 
     linebox.width = inline_preferred_minimum_width(
-        document, linebox, skip_stack=skip_stack, first_line=True)
+        context, linebox, skip_stack=skip_stack, first_line=True)
 
-    linebox.height, _ = strut_layout(linebox.style)
+    linebox.height, _ = strut_layout(linebox.style, context.enable_hinting)
     linebox.position_y = position_y
     position_x, position_y, available_width = avoid_collisions(
-        document, linebox, containing_block, outer=False)
+        context, linebox, containing_block, outer=False)
     candidate_height = linebox.height
 
-    excluded_shapes = document.excluded_shapes[:]
+    excluded_shapes = context.excluded_shapes[:]
 
     while 1:
         linebox.position_x = position_x
@@ -94,33 +95,27 @@ def get_next_linebox(document, linebox, position_y, skip_stack,
         waiting_floats = []
 
         line, resume_at, preserved_line_break = split_inline_box(
-            document, linebox, position_x, max_x, skip_stack,
+            context, linebox, position_x, max_x, skip_stack,
             containing_block, device_size, line_absolutes,
             line_fixed, line_placeholders, waiting_floats)
 
-        remove_last_whitespace(document, line)
+        if is_phantom_linebox(line) and not preserved_line_break:
+            line.height = 0
+            break
+
+        remove_last_whitespace(context, line)
 
         bottom, top = line_box_verticality(line)
-        if bottom is None:
-            # No children at all
-            offset_y = 0
-            if preserved_line_break:
-                # Only the strut.
-                line.baseline = line.margin_top
-                line.height += line.margin_top + line.margin_bottom
-            else:
-                line.height = 0
-                line.baseline = 0
-        else:
-            assert top is not None
-            line.baseline = -top
-            line.position_y = top
-            line.height = bottom - top
-            offset_y = position_y - top
+        assert top is not None
+        assert bottom is not None
+        line.baseline = -top
+        line.position_y = top
+        line.height = bottom - top
+        offset_y = position_y - top
         line.margin_top = 0
         line.margin_bottom = 0
 
-        offset_x = text_align(document, line, available_width,
+        offset_x = text_align(context, line, available_width,
                               last=resume_at is None or preserved_line_break)
         if offset_x != 0 or offset_y != 0:
             line.translate(offset_x, offset_y)
@@ -129,13 +124,13 @@ def get_next_linebox(document, linebox, position_y, skip_stack,
             break
         candidate_height = line.height
 
-        new_excluded_shapes = document.excluded_shapes
-        document.excluded_shapes = excluded_shapes
+        new_excluded_shapes = context.excluded_shapes
+        context.excluded_shapes = excluded_shapes
         position_x, position_y, available_width = avoid_collisions(
-            document, line, containing_block, outer=False)
+            context, line, containing_block, outer=False)
         if (position_x, position_y) == (
-            linebox.position_x, linebox.position_y):
-            document.excluded_shapes = new_excluded_shapes
+                linebox.position_x, linebox.position_y):
+            context.excluded_shapes = new_excluded_shapes
             break
 
     absolute_boxes.extend(line_absolutes)
@@ -156,7 +151,7 @@ def get_next_linebox(document, linebox, position_y, skip_stack,
     for waiting_float in waiting_floats:
         waiting_float.position_y = waiting_floats_y
         waiting_float = float_layout(
-            document, waiting_float, containing_block, absolute_boxes,
+            context, waiting_float, containing_block, absolute_boxes,
             fixed_boxes)
         float_children.append(waiting_float)
     if float_children:
@@ -205,7 +200,7 @@ def skip_first_whitespace(box, skip_stack):
     return None
 
 
-def remove_last_whitespace(document, box):
+def remove_last_whitespace(context, box):
     """Remove in place space characters at the end of a line.
 
     This also reduces the width of the inline parents of the modified text.
@@ -224,7 +219,8 @@ def remove_last_whitespace(document, box):
     if new_text:
         if len(new_text) == len(box.text):
             return
-        new_box, resume, _ = split_text_box(document, box, box.width * 2, 0)
+        box.text = new_text
+        new_box, resume, _ = split_text_box(context, box, None, None, 0)
         assert new_box is not None
         assert resume is None
         space_width = box.width - new_box.width
@@ -232,7 +228,7 @@ def remove_last_whitespace(document, box):
     else:
         space_width = box.width
         box.width = 0
-    box.text = new_text
+        box.text = ''
 
     for ancestor in ancestors:
         ancestor.width -= space_width
@@ -247,21 +243,27 @@ def remove_last_whitespace(document, box):
     # 'white-space' set to 'pre-wrap', UAs may visually collapse them.
 
 
+@handle_min_max_width
 def replaced_box_width(box, device_size):
     """
     Compute and set the used width for replaced boxes (inline- or block-level)
     """
     # http://www.w3.org/TR/CSS21/visudet.html#inline-replaced-width
-    _surface, intrinsic_width, _intrinsic_height = box.replacement
+    intrinsic_width, intrinsic_height = box.replacement.get_intrinsic_size(
+        box.style.image_resolution)
     # TODO: update this when we have replaced elements that do not
     # always have an intrinsic width. (See commented code below.)
     assert intrinsic_width is not None
+    assert intrinsic_height is not None
 
     if box.width == 'auto':
-        box.width = intrinsic_width
+        if box.height == 'auto':
+            box.width = intrinsic_width
+        else:
+            intrinsic_ratio = intrinsic_width / intrinsic_height
+            box.width = box.height * intrinsic_ratio
 
     # Untested code for when we do not always have an intrinsic width.
-#    intrinsic_ratio = intrinsic_width / intrinsic_height
 #    if box.height == 'auto' and box.width == 'auto':
 #        if intrinsic_width is not None:
 #            box.width = intrinsic_width
@@ -289,12 +291,14 @@ def replaced_box_width(box, device_size):
 #            box.width = min(300, device_width)
 
 
+@handle_min_max_height
 def replaced_box_height(box, device_size):
     """
     Compute and set the used height for replaced boxes (inline- or block-level)
     """
     # http://www.w3.org/TR/CSS21/visudet.html#inline-replaced-height
-    _surface, intrinsic_width, intrinsic_height = box.replacement
+    intrinsic_width, intrinsic_height = box.replacement.get_intrinsic_size(
+        box.style.image_resolution)
     # TODO: update this when we have replaced elements that do not
     # always have intrinsic dimensions. (See commented code below.)
     assert intrinsic_width is not None
@@ -325,10 +329,6 @@ def replaced_box_height(box, device_size):
 #        box.height = min(150, device_width / 2)
 
 
-min_max_replaced_width = handle_min_max_width(replaced_box_width)
-min_max_replaced_height = handle_min_max_height(replaced_box_height)
-
-
 def inline_replaced_box_layout(box, device_size):
     """Lay out an inline :class:`boxes.ReplacedBox` ``box``."""
     for side in ['top', 'right', 'bottom', 'left']:
@@ -339,12 +339,12 @@ def inline_replaced_box_layout(box, device_size):
 
 def inline_replaced_box_width_height(box, device_size):
     if box.style.width == 'auto' and box.style.height == 'auto':
-        replaced_box_width(box, device_size)
-        replaced_box_height(box, device_size)
+        replaced_box_width.without_min_max(box, device_size)
+        replaced_box_height.without_min_max(box, device_size)
         min_max_auto_replaced(box)
     else:
-        min_max_replaced_width(box, device_size)
-        min_max_replaced_height(box, device_size)
+        replaced_box_width(box, device_size)
+        replaced_box_height(box, device_size)
 
 
 def min_max_auto_replaced(box):
@@ -364,6 +364,7 @@ def min_max_auto_replaced(box):
         'min' if height < min_height else 'max' if height > max_height else '')
 
     # Work around divisions by zero. These are pathological cases anyway.
+    # TODO: is there a cleaner way?
     if width == 0:
         width = 1e-6
     if height == 0:
@@ -404,7 +405,7 @@ def min_max_auto_replaced(box):
         box.height = min_height
 
 
-def atomic_box(document, box, position_x, skip_stack, containing_block,
+def atomic_box(context, box, position_x, skip_stack, containing_block,
                device_size, absolute_boxes, fixed_boxes):
     """Compute the width and the height of the atomic ``box``."""
     if isinstance(box, boxes.ReplacedBox):
@@ -416,17 +417,17 @@ def atomic_box(document, box, position_x, skip_stack, containing_block,
     elif isinstance(box, boxes.InlineBlockBox):
         if box.is_table_wrapper:
             table_wrapper_width(
-                document, box,
+                context, box,
                 (containing_block.width, containing_block.height))
         box = inline_block_box_layout(
-            document, box, position_x, skip_stack, containing_block,
+            context, box, position_x, skip_stack, containing_block,
             device_size, absolute_boxes, fixed_boxes)
     else:  # pragma: no cover
         raise TypeError('Layout for %s not handled yet' % type(box).__name__)
     return box
 
 
-def inline_block_box_layout(document, box, position_x, skip_stack,
+def inline_block_box_layout(context, box, position_x, skip_stack,
                             containing_block, device_size, absolute_boxes,
                             fixed_boxes):
     # Avoid a circular import
@@ -440,12 +441,12 @@ def inline_block_box_layout(document, box, position_x, skip_stack,
     if box.margin_right == 'auto':
         box.margin_right = 0
 
-    inline_block_width(box, document, containing_block)
+    inline_block_width(box, context, containing_block)
 
     box.position_x = position_x
     box.position_y = 0
     box, _, _, _, _ = block_container_layout(
-        document, box, max_position_y=float('inf'), skip_stack=skip_stack,
+        context, box, max_position_y=float('inf'), skip_stack=skip_stack,
         device_size=device_size, page_is_empty=True,
         absolute_boxes=absolute_boxes, fixed_boxes=fixed_boxes)
     box.baseline = inline_block_baseline(box)
@@ -468,12 +469,12 @@ def inline_block_baseline(box):
 
 
 @handle_min_max_width
-def inline_block_width(box, document, containing_block):
+def inline_block_width(box, context, containing_block):
     if box.width == 'auto':
-        box.width = shrink_to_fit(document, box, containing_block.width)
+        box.width = shrink_to_fit(context, box, containing_block.width)
 
 
-def split_inline_level(document, box, position_x, max_x, skip_stack,
+def split_inline_level(context, box, position_x, max_x, skip_stack,
                        containing_block, device_size, absolute_boxes,
                        fixed_boxes, line_placeholders, waiting_floats):
     """Fit as much content as possible from an inline-level box in a width.
@@ -498,7 +499,7 @@ def split_inline_level(document, box, position_x, max_x, skip_stack,
             assert skip_stack is None
 
         new_box, skip, preserved_line_break = split_text_box(
-            document, box, max_x - position_x, skip)
+            context, box, max_x - position_x, max_x, skip)
 
         if skip is None:
             resume_at = None
@@ -510,21 +511,21 @@ def split_inline_level(document, box, position_x, max_x, skip_stack,
         if box.margin_right == 'auto':
             box.margin_right = 0
         new_box, resume_at, preserved_line_break = split_inline_box(
-            document, box, position_x, max_x, skip_stack, containing_block,
+            context, box, position_x, max_x, skip_stack, containing_block,
             device_size, absolute_boxes, fixed_boxes, line_placeholders,
             waiting_floats)
     elif isinstance(box, boxes.AtomicInlineLevelBox):
         new_box = atomic_box(
-            document, box, position_x, skip_stack, containing_block,
+            context, box, position_x, skip_stack, containing_block,
             device_size, absolute_boxes, fixed_boxes)
         new_box.position_x = position_x
         resume_at = None
         preserved_line_break = False
-    #else: unexpected box type here
+    # else: unexpected box type here
     return new_box, resume_at, preserved_line_break
 
 
-def split_inline_box(document, box, position_x, max_x, skip_stack,
+def split_inline_box(context, box, position_x, max_x, skip_stack,
                      containing_block, device_size, absolute_boxes,
                      fixed_boxes, line_placeholders, waiting_floats):
     """Same behavior as split_inline_level."""
@@ -533,8 +534,8 @@ def split_inline_box(document, box, position_x, max_x, skip_stack,
     assert isinstance(box, (boxes.LineBox, boxes.InlineBox))
     left_spacing = (box.padding_left + box.margin_left +
                     box.border_left_width)
-    right_spacing = (box.padding_right + box.margin_right +
-                     box.border_right_width)
+#    right_spacing = (box.padding_right + box.margin_right +
+#                     box.border_right_width)
     if is_start:
         position_x += left_spacing
     content_box_left = position_x
@@ -557,7 +558,6 @@ def split_inline_box(document, box, position_x, max_x, skip_stack,
             placeholder = AbsolutePlaceholder(child)
             line_placeholders.append(placeholder)
             children.append(placeholder)
-            absolute_boxes.append(placeholder)
             if child.style.position == 'absolute':
                 absolute_boxes.append(placeholder)
             else:
@@ -566,14 +566,23 @@ def split_inline_box(document, box, position_x, max_x, skip_stack,
         elif child.is_floated():
             child.position_x = position_x
             float_width = shrink_to_fit(
-                document, child, containing_block.width)
+                context, child, containing_block.width)
+
+            # To retrieve the real available space for floats, we must remove
+            # the trailing whitespaces from the line
+            non_floating_children = [
+                child_ for child_ in children if not child_.is_floated()]
+            if non_floating_children:
+                float_width -= trailing_whitespace_size(
+                    context, non_floating_children[-1])
+
             if float_width > max_x - position_x or waiting_floats:
                 # TODO: the absolute and fixed boxes in the floats must be
                 # added here, and not in iter_line_boxes
                 waiting_floats.append(child)
             else:
                 child = float_layout(
-                    document, child, containing_block, absolute_boxes,
+                    context, child, containing_block, absolute_boxes,
                     fixed_boxes)
                 children.append(child)
                 # TODO: use the main text direction of the line
@@ -591,7 +600,7 @@ def split_inline_box(document, box, position_x, max_x, skip_stack,
             continue
 
         new_child, resume_at, preserved = split_inline_level(
-            document, child, position_x, max_x, skip_stack, containing_block,
+            context, child, position_x, max_x, skip_stack, containing_block,
             device_size, absolute_boxes, fixed_boxes, line_placeholders,
             waiting_floats)
         skip_stack = None
@@ -638,23 +647,24 @@ def split_inline_box(document, box, position_x, max_x, skip_stack,
         new_box.position_x = initial_position_x
         new_box.width = position_x - content_box_left
 
-    line_height, new_box.baseline = strut_layout(box.style)
+    line_height, new_box.baseline = strut_layout(
+        box.style, context.enable_hinting)
     new_box.height = box.style.font_size
     half_leading = (line_height - new_box.height) / 2.
     # Set margins to the half leading but also compensate for borders and
     # paddings. We want margin_height() == line_height
     new_box.margin_top = (half_leading - new_box.border_top_width -
-                          new_box.padding_bottom)
+                          new_box.padding_top)
     new_box.margin_bottom = (half_leading - new_box.border_bottom_width -
                              new_box.padding_bottom)
 
     if new_box.style.position == 'relative':
         for absolute_box in absolute_boxes:
-            absolute_layout(document, absolute_box, new_box, fixed_boxes)
+            absolute_layout(context, absolute_box, new_box, fixed_boxes)
     return new_box, resume_at, preserved_line_break
 
 
-def split_text_box(document, box, available_width, skip):
+def split_text_box(context, box, available_width, line_width, skip):
     """Keep as much text as possible from a TextBox in a limitied width.
     Try not to overflow but always have some text in ``new_box``
 
@@ -672,7 +682,7 @@ def split_text_box(document, box, available_width, skip):
         return None, None, False
     # XXX ``resume_at`` is an index in UTF-8 bytes, not unicode codepoints.
     layout, length, resume_at, width, height, baseline = split_first_line(
-        text, box.style, document.enable_hinting, available_width)
+        text, box.style, context.enable_hinting, available_width, line_width)
 
     # Convert ``length`` and ``resume_at`` from UTF-8 indexes in text
     # to Unicode indexes.
@@ -684,8 +694,17 @@ def split_text_box(document, box, available_width, skip):
     new_text = utf8_text[:length].decode('utf8')
     new_length = len(new_text)
     if resume_at is not None:
-        between = utf8_text[length:resume_at].decode('utf8')
-        resume_at = new_length + len(between)
+        if length > resume_at:
+            # Text has been hyphenated
+            new_text += box.style.hyphenate_character
+            between = ''
+        else:
+            between = utf8_text[length:resume_at].decode('utf8')
+            if width > available_width:
+                if between.strip(' ') not in ('', '\n', '\u2029'):
+                    # Replace bad cutting value from Pango
+                    between = utf8_text[length:new_length].decode('utf8')
+            resume_at = new_length + len(between)
     length = new_length
 
     if length > 0:
@@ -700,7 +719,7 @@ def split_text_box(document, box, available_width, skip):
         # "only the 'line-height' is used when calculating the height
         #  of the line box."
         # Set margins so that margin_height() == line_height
-        line_height, _ = strut_layout(box.style)
+        line_height, _ = strut_layout(box.style, context.enable_hinting)
         half_leading = (line_height - height) / 2.
         box.margin_top = half_leading
         box.margin_bottom = half_leading
@@ -708,18 +727,19 @@ def split_text_box(document, box, available_width, skip):
         box.baseline = baseline
         # form the top of the margin box
         box.baseline += box.margin_top
-        assert box.border_top_width == box.padding_top == 0
     else:
         box = None
 
     if resume_at is None:
         preserved_line_break = False
     else:
-        preserved_line_break = (length != resume_at)
+        preserved_line_break = (length != resume_at) and between.strip(' ')
         if preserved_line_break:
             # See http://unicode.org/reports/tr14/
             # TODO: are there others? Find Pango docs on this
-            assert between in ('\n', '\u2029'), (
+            # The space is in this list, as it may have been removed by the
+            # Step #2 of split_first_line
+            assert between in (' ', '\n', '\u2029'), (
                 'Got %r between two lines. '
                 'Expected nothing or a preserved line break' % (between,))
         resume_at += skip
@@ -739,18 +759,17 @@ def line_box_verticality(box):
 
     """
     top_bottom_subtrees = []
-    subtrees_with_min_max = []
     max_y, min_y = aligned_subtree_verticality(
         box, top_bottom_subtrees, baseline_y=0)
-    for subtree in top_bottom_subtrees:
-        if subtree.is_floated():
-            sub_min_y = None
-            sub_max_y = None
-        else:
-            sub_max_y, sub_min_y = aligned_subtree_verticality(
+    subtrees_with_min_max = [
+        (subtree, sub_max_y, sub_min_y)
+        for subtree in top_bottom_subtrees
+        for sub_max_y, sub_min_y in [
+            (None, None) if subtree.is_floated()
+            else aligned_subtree_verticality(
                 subtree, top_bottom_subtrees, baseline_y=0)
-        subtrees_with_min_max.append(
-            (subtree, sub_max_y, sub_min_y))
+        ]
+    ]
 
     if subtrees_with_min_max:
         sub_positions = [
@@ -786,7 +805,6 @@ def translate_subtree(box, dy):
 
 def aligned_subtree_verticality(box, top_bottom_subtrees, baseline_y):
     max_y, min_y = inline_box_verticality(box, top_bottom_subtrees, baseline_y)
-
     # Account for the line box itself:
     top = baseline_y - box.baseline
     bottom = top + box.margin_height()
@@ -822,8 +840,7 @@ def inline_box_verticality(box, top_bottom_subtrees, baseline_y):
         if vertical_align == 'baseline':
             child_baseline_y = baseline_y
         elif vertical_align == 'middle':
-            # TODO: find ex from font metrics
-            one_ex = box.style.font_size * 0.5
+            one_ex = box.style.font_size * ex_ratio(box.style)
             top = baseline_y - (one_ex + child.margin_height()) / 2.
             child_baseline_y = top + child.baseline
         # TODO: actually implement vertical-align: top and bottom
@@ -838,15 +855,14 @@ def inline_box_verticality(box, top_bottom_subtrees, baseline_y):
                       box.border_top_width + box.padding_top + box.height)
             child_baseline_y = bottom - child.margin_height() + child.baseline
         elif vertical_align in ('top', 'bottom'):
-            top_bottom_subtrees.append(child)
             # Later, we will assume for this subtree that its baseline
             # is at y=0.
-            child.position_y = -child.baseline
-            continue
+            child_baseline_y = 0
         else:
             # Numeric value: The child’s baseline is `vertical_align` above
             # (lower y) the parent’s baseline.
             child_baseline_y = baseline_y - vertical_align
+
         # the child’s `top` is `child.baseline` above (lower y) its baseline.
         top = child_baseline_y - child.baseline
         if isinstance(child, boxes.InlineBlockBox):
@@ -855,6 +871,13 @@ def inline_box_verticality(box, top_bottom_subtrees, baseline_y):
         else:
             child.position_y = top
             # grand-children for inline boxes are handled below
+
+        if vertical_align in ('top', 'bottom'):
+            # top or bottom are special, they need to be handled in
+            # a later pass.
+            top_bottom_subtrees.append(child)
+            continue
+
         bottom = top + child.margin_height()
         if min_y is None or top < min_y:
             min_y = top
@@ -863,29 +886,14 @@ def inline_box_verticality(box, top_bottom_subtrees, baseline_y):
         if isinstance(child, boxes.InlineBox):
             children_max_y, children_min_y = inline_box_verticality(
                 child, top_bottom_subtrees, child_baseline_y)
-            if children_max_y is None:
-                if (
-                    child.margin_width() == 0
-                    # Guard against the case where a negative margin
-                    # compensates something else.
-                    and child.margin_left == 0
-                    and child.margin_right == 0
-                ):
-                    # No content, ignore this box’s line-height.
-                    # See http://www.w3.org/TR/CSS21/visuren.html#phantom-line-box
-                    child.position_y = child_baseline_y
-                    child.height = 0
-                    continue
-            else:
-                assert children_min_y is not None
-                if children_min_y < min_y:
-                    min_y = children_min_y
-                if children_max_y > max_y:
-                    max_y = children_max_y
+            if children_min_y is not None and children_min_y < min_y:
+                min_y = children_min_y
+            if children_max_y is not None and children_max_y > max_y:
+                max_y = children_max_y
     return max_y, min_y
 
 
-def text_align(document, line, available_width, last):
+def text_align(context, line, available_width, last):
     """Return how much the line should be moved horizontally according to
     the `text-align` property.
 
@@ -902,7 +910,7 @@ def text_align(document, line, available_width, last):
         return 0
     offset = available_width - line.width
     if align == 'justify':
-        justify_line(document, line, offset)
+        justify_line(context, line, offset)
         return 0
     if align == 'center':
         offset /= 2.
@@ -911,12 +919,12 @@ def text_align(document, line, available_width, last):
     return offset
 
 
-def justify_line(document, line, extra_width):
+def justify_line(context, line, extra_width):
     nb_spaces = count_spaces(line)
     if nb_spaces == 0:
         # TODO: what should we do with single-word lines?
         return
-    add_word_spacing(document, line, extra_width / nb_spaces, 0)
+    add_word_spacing(context, line, extra_width / nb_spaces, 0)
 
 
 def count_spaces(box):
@@ -929,18 +937,18 @@ def count_spaces(box):
         return 0
 
 
-def add_word_spacing(document, box, extra_word_spacing, x_advance):
+def add_word_spacing(context, box, extra_word_spacing, x_advance):
     if isinstance(box, boxes.TextBox):
         box.position_x += x_advance
         box.style.word_spacing += extra_word_spacing
         nb_spaces = count_spaces(box)
         if nb_spaces > 0:
             new_box, resume_at, _ = split_text_box(
-                document, box, 1e10, 0)
+                context, box, 1e10, None, 0)
             assert new_box is not None
             assert resume_at is None
             # XXX new_box.width - box.width is always 0???
-            #x_advance +=  new_box.width - box.width
+            # x_advance +=  new_box.width - box.width
             x_advance += extra_word_spacing * nb_spaces
             box.width = new_box.width
             box.pango_layout = new_box.pango_layout
@@ -949,9 +957,25 @@ def add_word_spacing(document, box, extra_word_spacing, x_advance):
         previous_x_advance = x_advance
         for child in box.children:
             x_advance = add_word_spacing(
-                document, child, extra_word_spacing, x_advance)
+                context, child, extra_word_spacing, x_advance)
         box.width += x_advance - previous_x_advance
     else:
         # Atomic inline-level box
         box.translate(x_advance, 0)
     return x_advance
+
+
+def is_phantom_linebox(linebox):
+    """http://www.w3.org/TR/CSS21/visuren.html#phantom-line-box"""
+    for child in linebox.children:
+        if isinstance(child, boxes.InlineBox):
+            if not is_phantom_linebox(child):
+                return False
+            for side in ('top', 'right', 'bottom', 'left'):
+                if (getattr(child.style['margin_%s' % side], 'value', None) or
+                        child.style['border_%s_width' % side] or
+                        child.style['padding_%s' % side].value):
+                    return False
+        elif child.is_in_normal_flow():
+            return False
+    return True

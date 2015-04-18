@@ -6,20 +6,20 @@
     Tests for layout, ie. positioning and dimensioning of boxes,
     line breaks, page breaks.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
 
-from .testing_utils import (
-    TestPNGDocument, resource_filename, FONTS, assert_no_logs, capture_logs)
+import math
+
+import pytest
+
+from .testing_utils import FONTS, assert_no_logs, capture_logs, almost_equal
 from ..formatting_structure import boxes
-from ..layout.inlines import split_inline_box
-from ..layout.percentages import resolve_percentages
-from ..layout.preferred import (inline_preferred_width,
-                                inline_preferred_minimum_width)
+from .test_boxes import render_pages as parse
 
 
 def body_children(page):
@@ -29,21 +29,6 @@ def body_children(page):
     body, = html.children
     assert body.element_tag == 'body'
     return body.children
-
-
-def parse_without_layout(html_content):
-    """Parse some HTML, apply stylesheets, transform to boxes."""
-    return TestPNGDocument(html_content)
-
-
-def parse(html_content, return_document=False):
-    """Parse some HTML, apply stylesheets, transform to boxes and lay out."""
-    document = TestPNGDocument(html_content,
-        base_url=resource_filename('<inline HTML>'))
-    if return_document:
-        return document
-    else:
-        return document.pages
 
 
 def outer_area(box):
@@ -249,73 +234,59 @@ def test_block_widths():
     # 'margin-right: 0' was ignored.
     assert paragraphs[1].width == 50
     assert paragraphs[1].margin_left == 0
-    assert paragraphs[1].margin_right == 44
 
-    # No 'auto', over-constrained equation with ltr, the initial
-    # 'margin-right: 0' was ignored.
+    # No 'auto', over-constrained equation with rtl, the initial
+    # 'margin-left: 0' was ignored.
     assert paragraphs[2].width == 50
-    assert paragraphs[2].margin_left == 44
     assert paragraphs[2].margin_right == 0
 
     # width is 'auto'
     assert paragraphs[3].width == 64
     assert paragraphs[3].margin_left == 20
-    assert paragraphs[3].margin_right == 10
 
     # margin-right is 'auto'
     assert paragraphs[4].width == 50
     assert paragraphs[4].margin_left == 20
-    assert paragraphs[4].margin_right == 24
 
     # margin-left is 'auto'
     assert paragraphs[5].width == 50
     assert paragraphs[5].margin_left == 24
-    assert paragraphs[5].margin_right == 20
 
     # Both margins are 'auto', remaining space is split in half
     assert paragraphs[6].width == 50
     assert paragraphs[6].margin_left == 22
-    assert paragraphs[6].margin_right == 22
 
     # width is 'auto', other 'auto' are set to 0
     assert paragraphs[7].width == 74
     assert paragraphs[7].margin_left == 20
-    assert paragraphs[7].margin_right == 0
 
     # width is 'auto', other 'auto' are set to 0
     assert paragraphs[8].width == 74
     assert paragraphs[8].margin_left == 0
-    assert paragraphs[8].margin_right == 20
 
     # width is 'auto', other 'auto' are set to 0
     assert paragraphs[9].width == 94
     assert paragraphs[9].margin_left == 0
-    assert paragraphs[9].margin_right == 0
 
     # sum of non-auto initially is too wide, set auto values to 0
     assert paragraphs[10].width == 200
     assert paragraphs[10].margin_left == 0
-    assert paragraphs[10].margin_right == -106
 
     # Constrained by min-width, same as above
     assert paragraphs[11].width == 200
     assert paragraphs[11].margin_left == 0
-    assert paragraphs[11].margin_right == -106
 
     # Constrained by max-width, same as paragraphs[6]
     assert paragraphs[12].width == 50
     assert paragraphs[12].margin_left == 22
-    assert paragraphs[12].margin_right == 22
 
     # NOT constrained by min-width
     assert paragraphs[13].width == 94
     assert paragraphs[13].margin_left == 0
-    assert paragraphs[13].margin_right == 0
 
     # 70%
     assert paragraphs[14].width == 70
     assert paragraphs[14].margin_left == 0
-    assert paragraphs[14].margin_right == 24
 
 
 @assert_no_logs
@@ -477,8 +448,8 @@ def test_inline_block_sizes():
           </div>
         </div>
         <div style="min-width: 185px">foo</div>
-        <div style="max-width: 10px">Supercalifragilisticexpialidocious</div>
-    ''')
+        <div style="max-width: 10px
+          ">Supercalifragilisticexpialidocious</div>''')
     html, = page.children
     assert html.element_tag == 'html'
     body, = html.children
@@ -550,8 +521,7 @@ def test_inline_block_sizes():
     # of the layout, which often resulted in a line break just before
     # the last word.
     page, = parse('''
-        <p style="display: inline-block">Lorem ipsum dolor sit amet …</p>
-    ''')
+        <p style="display: inline-block">Lorem ipsum dolor sit amet …</p>''')
     html, = page.children
     body, = html.children
     outer_line, = body.children
@@ -595,6 +565,45 @@ def test_inline_table():
 
 
 @assert_no_logs
+def test_implicit_width_table():
+    """Test table with implicit width."""
+    # See https://github.com/Kozea/WeasyPrint/issues/169
+    page, = parse('''
+        <table>
+            <col style="width:25%"></col>
+            <col></col>
+            <tr>
+                <td></td>
+                <td></td>
+            </tr>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2 = row.children
+
+    page, = parse('''
+        <table>
+            <tr>
+                <td style="width:25%"></td>
+                <td></td>
+            </tr>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2 = row.children
+
+
+@assert_no_logs
 def test_fixed_layout_table():
     """Test the fixed layout table elements sizes."""
     page, = parse('''
@@ -618,7 +627,7 @@ def test_fixed_layout_table():
     td_1, td_2 = row.children
     assert table_wrapper.position_x == 0
     assert table.position_x == 5  # 0 + margin-left
-    assert td_1.position_x == 15  # 0 + border-spacing
+    assert td_1.position_x == 15  # 5 + border-spacing
     assert td_1.width == 20
     assert td_2.position_x == 45  # 15 + 20 + border-spacing
     assert td_2.width == 40
@@ -709,6 +718,46 @@ def test_fixed_layout_table():
     assert td_2.width == 20
     assert table.width == 100
 
+    # With border-collapse
+    page, = parse('''
+        <style>
+          /* Do not apply: */
+          colgroup, col, tbody, tr, td { margin: 1000px }
+        </style>
+        <table style="table-layout: fixed;
+                      border-collapse: collapse; border: 10px solid;
+                      /* ignored with collapsed borders: */
+                      border-spacing: 10000px; padding: 1000px">
+            <colgroup>
+              <col style="width: 30px" />
+            </colgroup>
+            <tbody>
+              <tr>
+                <td style="padding: 2px"></td>
+                <td style="width: 34px; padding: 10px; border: 2px solid"></td>
+              </tr>
+            </tbody>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2 = row.children
+    assert table_wrapper.position_x == 0
+    assert table.position_x == 0
+    assert table.border_left_width == 5  # half of the collapsed 10px border
+    assert td_1.position_x == 5  # border-spacing is ignored
+    assert td_1.margin_width() == 30  # as <col>
+    assert td_1.width == 20  # 30 - 5 (border-left) - 1 (border-right) - 2*2
+    assert td_2.position_x == 35
+    assert td_2.width == 34
+    assert td_2.margin_width() == 60  # 34 + 2*10 + 5 + 1
+    assert table.width == 90  # 30 + 60
+    assert table.margin_width() == 100  # 90 + 2*5 (border)
+
 
 @assert_no_logs
 def test_auto_layout_table():
@@ -767,7 +816,7 @@ def test_auto_layout_table():
     assert table.width == 27  # 3 * spacing + 4 + 8 + 4 * border
 
     page, = parse('''
-        <table style="border-spacing: 1px; margin: 5px">
+        <table style="border-spacing: 1px; margin: 5px; font-size: 0">
             <tr>
                 <td></td>
                 <td><img src=pattern.png><img src=pattern.png></td>
@@ -1128,6 +1177,222 @@ def test_auto_layout_table():
     assert td_2.width == 10
     assert table.width == 30
 
+    # With border-collapse
+    page, = parse('''
+        <style>
+          /* Do not apply: */
+          colgroup, col, tbody, tr, td { margin: 1000px }
+        </style>
+        <table style="border-collapse: collapse; border: 10px solid;
+                      /* ignored with collapsed borders: */
+                      border-spacing: 10000px; padding: 1000px">
+            <colgroup>
+              <col style="width: 30px" />
+            </colgroup>
+            <tbody>
+              <tr>
+                <td style="padding: 2px"></td>
+                <td style="width: 34px; padding: 10px; border: 2px solid"></td>
+              </tr>
+            </tbody>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2 = row.children
+    assert table_wrapper.position_x == 0
+    assert table.position_x == 0
+    assert table.border_left_width == 5  # half of the collapsed 10px border
+    assert td_1.position_x == 5  # border-spacing is ignored
+    assert td_1.margin_width() == 30  # as <col>
+    assert td_1.width == 20  # 30 - 5 (border-left) - 1 (border-right) - 2*2
+    assert td_2.position_x == 35
+    assert td_2.width == 34
+    assert td_2.margin_width() == 60  # 34 + 2*10 + 5 + 1
+    assert table.width == 90  # 30 + 60
+    assert table.margin_width() == 100  # 90 + 2*5 (border)
+
+    # Column widths as percentage
+    page, = parse('''
+        <table style="width: 200px">
+            <colgroup>
+              <col style="width: 70%" />
+              <col style="width: 30%" />
+            </colgroup>
+            <tbody>
+              <tr>
+                <td>a</td>
+                <td>abc</td>
+              </tr>
+            </tbody>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2 = row.children
+    assert td_1.width == 140
+    assert td_2.width == 60
+    assert table.width == 200
+
+    # Column group width
+    page, = parse('''
+        <table style="width: 200px">
+            <colgroup style="width: 100px">
+              <col />
+              <col />
+            </colgroup>
+            <col style="width: 100px" />
+            <tbody>
+              <tr>
+                <td>a</td>
+                <td>a</td>
+                <td>abc</td>
+              </tr>
+            </tbody>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2, td_3 = row.children
+    assert td_1.width == 50
+    assert td_2.width == 50
+    assert td_3.width == 100
+    assert table.width == 200
+
+    # Column group width as percentage
+    page, = parse('''
+        <table style="width: 200px">
+            <colgroup style="width: 100px">
+              <col />
+              <col />
+            </colgroup>
+            <colgroup style="width: 50%">
+              <col />
+              <col />
+            </colgroup>
+            <tbody>
+              <tr>
+                <td>a</td>
+                <td>a</td>
+                <td>abc</td>
+                <td>abc</td>
+              </tr>
+            </tbody>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2, td_3, td_4 = row.children
+    assert td_1.width == 50
+    assert td_2.width == 50
+    assert td_3.width == 50
+    assert td_4.width == 50
+    assert table.width == 200
+
+    # Wrong column group width
+    page, = parse('''
+        <table style="width: 200px">
+            <colgroup style="width: 80%">
+              <col />
+              <col />
+            </colgroup>
+            <tbody>
+              <tr>
+                <td>a</td>
+                <td>a</td>
+              </tr>
+            </tbody>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2 = row.children
+    assert td_1.width == 100
+    assert td_2.width == 100
+    assert table.width == 200
+
+    # Column width as percentage and cell width in pixels
+    page, = parse('''
+        <table style="width: 200px">
+            <colgroup>
+              <col style="width: 70%" />
+              <col />
+            </colgroup>
+            <tbody>
+              <tr>
+                <td>a</td>
+                <td style="width: 60px">abc</td>
+              </tr>
+            </tbody>
+        </table>
+    ''')
+    html, = page.children
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2 = row.children
+    assert td_1.width == 140
+    assert td_2.width == 60
+    assert table.width == 200
+
+    # Column width and cell width as percentage
+    page, = parse('''
+        <div style="width: 400px">
+            <table style="width: 50%">
+                <colgroup>
+                    <col style="width: 70%" />
+                    <col />
+                </colgroup>
+                <tbody>
+                    <tr>
+                        <td>a</td>
+                        <td style="width: 30%">abc</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    ''')
+    html, = page.children
+    body, = html.children
+    div, = body.children
+    table_wrapper, = div.children
+    table, = table_wrapper.children
+    row_group, = table.children
+    row, = row_group.children
+    td_1, td_2 = row.children
+    assert td_1.width == 140
+    assert td_2.width == 60
+    assert table.width == 200
+
+    # Test regression on a crash: https://github.com/Kozea/WeasyPrint/pull/152
+    page, = parse('''
+        <table>
+            <td style="width: 50%">
+        </table>
+    ''')
+
 
 @assert_no_logs
 def test_lists():
@@ -1189,6 +1454,8 @@ def test_empty_linebox():
         <p><br>  </p>
     ''')
     paragraph, = body_children(page)
+    # TODO: The second line should be removed
+    pytest.xfail()
     assert len(paragraph.children) == 1
 
 
@@ -1348,29 +1615,31 @@ def test_page_breaks():
         assert all([div.element_tag == 'div' for div in divs])
         assert all([div.position_x == 10 for div in divs])
         page_divs.append(divs)
+        del divs
 
     positions_y = [[div.position_y for div in divs] for divs in page_divs]
     assert positions_y == [[10, 40], [10, 40], [10]]
 
     # Same as above, but no content inside each <div>.
-    # TODO: This currently gives no page break. Should it?
-#    pages = parse('''
-#        <style>
-#            @page { size: 100px; margin: 10px }
-#            body { margin: 0 }
-#            div { height: 30px }
-#        </style>
-#        <div/><div/><div/><div/><div/>
-#    ''')
-#    page_divs = []
-#    for page in pages:
-#        divs = body_children(page)
-#        assert all([div.element_tag == 'div' for div in divs])
-#        assert all([div.position_x == 10 for div in divs])
-#        page_divs.append(divs)
+    # This used to produce no page break.
+    pages = parse('''
+        <style>
+            @page { size: 100px; margin: 10px }
+            body { margin: 0 }
+            div { height: 30px }
+        </style>
+        <div></div><div></div><div></div><div></div><div></div>
+    ''')
+    page_divs = []
+    for page in pages:
+        divs = body_children(page)
+        assert all([div.element_tag == 'div' for div in divs])
+        assert all([div.position_x == 10 for div in divs])
+        page_divs.append(divs)
+        del divs
 
-#    positions_y = [[div.position_y for div in divs] for divs in page_divs]
-#    assert positions_y == [[10, 40], [10, 40], [10]]
+    positions_y = [[div.position_y for div in divs] for divs in page_divs]
+    assert positions_y == [[10, 40], [10, 40], [10]]
 
     pages = parse('''
         <style>
@@ -1390,10 +1659,10 @@ def test_page_breaks():
         assert all([img.element_tag == 'img' for img in images])
         assert all([img.position_x == 10 for img in images])
         page_images.append(images)
+        del images
     positions_y = [[img.position_y for img in images]
                    for images in page_images]
     assert positions_y == [[10, 40], [10, 40], [10]]
-
 
     page_1, page_2, page_3, page_4 = parse('''
         <style>
@@ -1448,7 +1717,6 @@ def test_page_breaks():
     section, = article.children
     ulist, = section.children
     assert ulist.element_tag == 'ul'
-
 
     # Reference for the following test:
     # Without any 'avoid', this breaks after the <div>
@@ -1525,7 +1793,8 @@ def test_page_breaks():
                 <div>
                     <p style="page-break-inside: avoid">
                         ><img src=pattern.png><br/><img src=pattern.png></p>
-                    <p style="page-break-before: avoid; page-break-after: avoid;
+                    <p style="page-break-before: avoid;
+                              page-break-after: avoid;
                               widows: 2"
                         ><img src=pattern.png><br/><img src=pattern.png></p>
                 </div>
@@ -1609,13 +1878,63 @@ def test_page_breaks():
     # TODO: currently this is 60: we do not decrease the used height of
     # blocks with 'height: auto' when we remove children from them for
     # some page-break-*: avoid.
-    #assert div.height == 30
+    # assert div.height == 30
     html, = page_3.children
     body, = html.children
     div, img_4, img_5, = body.children
     assert div.height == 30
     assert img_4.height == 30
     assert img_5.height == 30
+
+    page_1, page_2, page_3 = parse('''
+        <style>
+            @page {
+                @bottom-center { content: counter(page) }
+            }
+            @page:blank {
+                @bottom-center { content: none }
+            }
+        </style>
+        <p style="page-break-after: right">foo</p>
+        <p>bar</p>
+    ''')
+    assert len(page_1.children) == 2  # content and @bottom-center
+    assert len(page_2.children) == 1  # content only
+    assert len(page_3.children) == 2  # content and @bottom-center
+
+    page_1, page_2 = parse('''
+        <style>
+          @page { size: 75px; margin: 0 }
+          div { height: 20px }
+        </style>
+        <body>
+          <div></div>
+          <section>
+            <div></div>
+            <div style="page-break-after: avoid">
+              <div style="position: absolute"></div>
+              <div style="position: fixed"></div>
+            </div>
+          </section>
+          <div></div>
+    ''')
+    html, = page_1.children
+    body, _div = html.children
+    div_1, section = body.children
+    div_2, = section.children
+    assert div_1.position_y == 0
+    assert div_2.position_y == 20
+    assert div_1.height == 20
+    assert div_2.height == 20
+    html, = page_2.children
+    body, = html.children
+    section, div_4 = body.children
+    div_3, = section.children
+    absolute, fixed = div_3.children
+    assert div_3.position_y == 0
+    assert div_4.position_y == 20
+    assert div_3.height == 20
+    assert div_4.height == 20
 
 
 @assert_no_logs
@@ -1840,152 +2159,27 @@ def test_table_page_breaks():
 @assert_no_logs
 def test_inlinebox_spliting():
     """Test the inline boxes spliting."""
-    def get_inlinebox(content):
-        """Helper returning a inlinebox with customizable style."""
-        page = '<style>p { font-family:%(fonts)s;}</style>'
-        page = '%s <p>%s</p>' % (page, content)
-        document = parse_without_layout(page % {'fonts': FONTS})
-        html = document.formatting_structure
+    for width in [10000, 100, 10, 0]:
+        page, = parse('''
+            <style>p { font-family:%(fonts)s; width: %(width)spx; }</style>
+            <p><strong>WeasyPrint is a free software visual rendering engine
+                       for HTML and CSS.</strong></p>
+        ''' % {'fonts': FONTS, 'width': width})
+        html, = page.children
         body, = html.children
         paragraph, = body.children
-        line, = paragraph.children
-        inline, = line.children
-        paragraph.width = 200
-        paragraph.height = 'auto'
-        return document, inline, paragraph
-
-    def get_parts(document, inlinebox, width, parent):
-        """Yield the parts of the splitted ``inlinebox`` of given ``width``."""
-        skip = None
-        while 1:
-            inlinebox.position_y = 0
-            box, skip, _ = split_inline_box(
-                document, inlinebox, 0, width, skip, parent, None,
-                [], [], [], [])
-            yield box
-            if skip is None:
-                break
-
-    def get_joined_text(parts):
-        """Get the joined text from ``parts``."""
-        return ''.join(part.children[0].text for part in parts)
-
-    def test_inlinebox_spacing(inlinebox, value, side):
-        """Test the margin, padding and border-width of ``inlinebox``."""
-        if side in ['left', 'right']:
-            # Vertical margins on inlines are irrelevant.
-            assert getattr(inlinebox, 'margin_%s' % side) == value
-        assert getattr(inlinebox, 'padding_%s' % side) == value
-        assert getattr(inlinebox, 'border_%s_width' % side) == value
-
-    content = '''<strong>WeasyPrint is a free software visual rendering engine
-              for HTML and CSS</strong>'''
-
-    document, inlinebox, parent = get_inlinebox(content)
-    resolve_percentages(inlinebox, parent)
-    original_text = inlinebox.children[0].text
-
-    # test with width = 1000
-    parts = list(get_parts(document, inlinebox, 1000, parent))
-    assert len(parts) == 1
-    assert original_text == get_joined_text(parts)
-
-    document, inlinebox, parent = get_inlinebox(content)
-    resolve_percentages(inlinebox, parent)
-    original_text = inlinebox.children[0].text
-
-    # test with width = 100
-    parts = list(get_parts(document, inlinebox, 100, parent))
-    assert len(parts) > 1
-    assert original_text == get_joined_text(parts)
-
-    document, inlinebox, parent = get_inlinebox(content)
-    resolve_percentages(inlinebox, parent)
-    original_text = inlinebox.children[0].text
-
-    # test with width = 10
-    parts = list(get_parts(document, inlinebox, 10, parent))
-    assert len(parts) > 1
-    assert original_text == get_joined_text(parts)
-
-    # test with width = 0
-    parts = list(get_parts(document, inlinebox, 0, parent))
-    assert len(parts) > 1
-    assert original_text == get_joined_text(parts)
-
-    # with margin-border-padding
-    content = '''<strong style="border:10px solid; margin:10px; padding:10px">
-              WeasyPrint is a free software visual rendering engine
-              for HTML and CSS</strong>'''
-
-    document, inlinebox, parent = get_inlinebox(content)
-    resolve_percentages(inlinebox, parent)
-    original_text = inlinebox.children[0].text
-    # test with width = 1000
-    parts = list(get_parts(document, inlinebox, 1000, parent))
-    assert len(parts) == 1
-    assert original_text == get_joined_text(parts)
-    for side in ('left', 'top', 'bottom', 'right'):
-        test_inlinebox_spacing(parts[0], 10, side)
-
-    document, inlinebox, parent = get_inlinebox(content)
-    resolve_percentages(inlinebox, parent)
-    original_text = inlinebox.children[0].text
-
-    # test with width = 1000
-    parts = list(get_parts(document, inlinebox, 100, parent))
-    assert len(parts) != 1
-    assert original_text == get_joined_text(parts)
-    first_inline_box = parts.pop(0)
-    test_inlinebox_spacing(first_inline_box, 10, 'left')
-    test_inlinebox_spacing(first_inline_box, 0, 'right')
-    last_inline_box = parts.pop()
-    test_inlinebox_spacing(last_inline_box, 10, 'right')
-    test_inlinebox_spacing(last_inline_box, 0, 'left')
-    for part in parts:
-        test_inlinebox_spacing(part, 0, 'right')
-        test_inlinebox_spacing(part, 0, 'left')
-
-
-@assert_no_logs
-def test_inlinebox_text_after_spliting():
-    """Test the inlinebox text after spliting."""
-    document = parse_without_layout('''
-        <style>p { width: 200px; font-family:%(fonts)s;}</style>
-        <p><strong><em><em><em>
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
-        </em></em></em></strong></p>
-    ''' % {'fonts': FONTS})
-    html = document.formatting_structure
-    body, = html.children
-    paragraph, = body.children
-    line, = paragraph.children
-    inlinebox, = line.children
-    paragraph.width = 200
-    paragraph.height = 'auto'
-    resolve_percentages(inlinebox, paragraph)
-
-    original_text = ''.join(
-        part.text for part in inlinebox.descendants()
-        if isinstance(part, boxes.TextBox))
-
-    # test with width = 10
-    parts = []
-    skip = None
-    while 1:
-        inlinebox.position_y = 0
-        box, skip, _ = split_inline_box(
-            document, inlinebox, 0, 100, skip, paragraph, None, [], [], [], [])
-        parts.append(box)
-        if skip is None:
-            break
-    assert len(parts) > 2
-    assert ''.join(
-        child.text
-        for part in parts
-        for child in part.descendants()
-        if isinstance(child, boxes.TextBox)
-    ) == original_text
+        lines = paragraph.children
+        if width == 10000:
+            assert len(lines) == 1
+        else:
+            assert len(lines) > 1
+        text_parts = []
+        for line in lines:
+            strong, = line.children
+            text, = strong.children
+            text_parts.append(text.text)
+        assert ' '.join(text_parts) == ('WeasyPrint is a free software visual '
+                                        'rendering engine for HTML and CSS.')
 
 
 @assert_no_logs
@@ -2034,7 +2228,7 @@ def test_whitespace_processing():
         assert text.text == 'a', 'source was %r' % (source,)
 
         page, = parse('<p style="white-space: pre-line">\n\n<em>%s</em></pre>'
-            % source.replace('\n', ' '))
+                      % source.replace('\n', ' '))
         html, = page.children
         body, = html.children
         p, = body.children
@@ -2060,7 +2254,7 @@ def test_images():
         '<img src="%s">' % url for url in [
             'pattern.png', 'pattern.gif', 'blue.jpg', 'pattern.svg',
             "data:image/svg+xml,<svg width='4' height='4'></svg>",
-            "data:image/svg+xml,<svg width='4px' height='4px'></svg>",
+            "DatA:image/svg+xml,<svg width='4px' height='4px'></svg>",
         ]
     ] + [
         '<embed src=pattern.png>',
@@ -2085,9 +2279,11 @@ def test_images():
 
     # Invalid images
     for url in [
-        'inexistant.png',
+        'nonexistent.png',
         'unknownprotocol://weasyprint.org/foo.png',
         'data:image/unknowntype,Not an image',
+        # Invalid protocol
+        'datå:image/svg+xml,<svg width="4" height="4"></svg>',
         # zero-byte images
         'data:image/png,',
         'data:image/jpeg,',
@@ -2101,14 +2297,27 @@ def test_images():
         with capture_logs() as logs:
             body, img = get_img("<img src='%s' alt='invalid image'>" % url)
         assert len(logs) == 1
-        assert 'WARNING: Error for image' in logs[0]
+        assert 'WARNING: Failed to load image' in logs[0]
         assert isinstance(img, boxes.InlineBox)  # not a replaced box
         text, = img.children
         assert text.text == 'invalid image', url
 
+    with capture_logs() as logs:
+        parse('<img src=nonexistent.png><img src=nonexistent.png>')
+    # Failures are cached too: only one warning
+    assert len(logs) == 1
+    assert 'WARNING: Failed to load image' in logs[0]
+
     # Layout rules try to preserve the ratio, so the height should be 40px too:
     body, img = get_img('''<body style="font-size: 0">
         <img src="pattern.png" style="width: 40px">''')
+    assert body.height == 40
+    assert img.position_y == 0
+    assert img.width == 40
+    assert img.height == 40
+
+    body, img = get_img('''<body style="font-size: 0">
+        <img src="pattern.png" style="height: 40px">''')
     assert body.height == 40
     assert img.position_y == 0
     assert img.width == 40
@@ -2133,7 +2342,7 @@ def test_images():
     assert img.width == 2
     assert img.height == 2
 
-    # display: table-cell is ignored
+    # display: table-cell is ignored. XXX Should it?
     page, = parse('''<body style="font-size: 0">
         <img src="pattern.png" style="width: 40px">
         <img src="pattern.png" style="width: 60px; display: table-cell">
@@ -2165,6 +2374,8 @@ def test_images():
     assert img.element_tag == 'img'
     assert img.position_x == 0
     assert img.position_y == 0
+    assert img.width == 40
+    assert img.height == 40
     assert img.content_box_x() == 30  # (100 - 40) / 2 == 30px for margin-left
     assert img.content_box_y() == 10
 
@@ -2182,9 +2393,65 @@ def test_images():
     assert img.element_tag == 'img'
     assert img.position_x == 0
     assert img.position_y == 0
+    assert img.width == 40
+    assert img.height == 40
     assert img.content_box_x() == 30  # (100 - 40) / 2 == 30px for margin-left
     assert img.content_box_y() == 10
 
+    page, = parse('''
+        <style>
+            @page { size: 100px }
+            img { min-width: 40px; margin: 10px auto; display: block }
+        </style>
+        <body>
+            <img src="pattern.png">
+    ''')
+    html, = page.children
+    body, = html.children
+    img, = body.children
+    assert img.element_tag == 'img'
+    assert img.position_x == 0
+    assert img.position_y == 0
+    assert img.width == 40
+    assert img.height == 40
+    assert img.content_box_x() == 30  # (100 - 40) / 2 == 30px for margin-left
+    assert img.content_box_y() == 10
+
+    page, = parse('''
+        <style>
+            @page { size: 100px }
+            img { min-height: 30px; max-width: 2px;
+                  margin: 10px auto; display: block }
+        </style>
+        <body>
+            <img src="pattern.png">
+    ''')
+    html, = page.children
+    body, = html.children
+    img, = body.children
+    assert img.element_tag == 'img'
+    assert img.position_x == 0
+    assert img.position_y == 0
+    assert img.width == 2
+    assert img.height == 30
+    assert img.content_box_x() == 49  # (100 - 2) / 2 == 49px for margin-left
+    assert img.content_box_y() == 10
+
+    page, = parse('''
+        <body style="float: left">
+        <img style="height: 200px; margin: 10px; display: block" src="
+            data:image/svg+xml,
+            <svg width='150' height='100'></svg>
+        ">
+    ''')
+    html, = page.children
+    body, = html.children
+    img, = body.children
+    assert body.width == 320
+    assert body.height == 220
+    assert img.element_tag == 'img'
+    assert img.width == 300
+    assert img.height == 200
 
 
 @assert_no_logs
@@ -2199,10 +2466,9 @@ def test_vertical_align():
     """
     page, = parse('''
         <span>
-            <img src="pattern.png" style="width: 40px">
-            <img src="pattern.png" style="width: 60px">
-        </span>
-    ''')
+            <img src="pattern.png" style="width: 40px"
+            ><img src="pattern.png" style="width: 60px"
+        ></span>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2227,10 +2493,8 @@ def test_vertical_align():
     """
     page, = parse('''
         <span>
-            <img src="pattern.png" style="width: 40px; vertical-align: -15px">
-            <img src="pattern.png" style="width: 60px">
-        </span>
-    ''')
+            <img src="pattern.png" style="width: 40px; vertical-align: -15px"
+            ><img src="pattern.png" style="width: 60px"></span>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2246,10 +2510,8 @@ def test_vertical_align():
     # Same as previously, but with percentages
     page, = parse('''
         <span style="line-height: 10px">
-            <img src="pattern.png" style="width: 40px; vertical-align: -150%">
-            <img src="pattern.png" style="width: 60px">
-        </span>
-    ''')
+            <img src="pattern.png" style="width: 40px; vertical-align: -150%"
+            ><img src="pattern.png" style="width: 60px"></span>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2266,11 +2528,8 @@ def test_vertical_align():
     page, = parse('''
         <span style="line-height: 10px">
             <span style="line-height: 10px; vertical-align: -15px">
-                <img src="pattern.png" style="width: 40px">
-            </span>
-            <img src="pattern.png" style="width: 60px">
-        </span>
-    ''')
+                <img src="pattern.png" style="width: 40px"></span>
+            <img src="pattern.png" style="width: 60px"></span>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2286,11 +2545,9 @@ def test_vertical_align():
 
     # Same as previously, but with percentages
     page, = parse('''
-        <span style="line-height: 12px; font-size: 12px">
-            <img src="pattern.png" style="width: 40px; vertical-align: middle">
-            <img src="pattern.png" style="width: 60px">
-        </span>
-    ''')
+        <span style="line-height: 12px; font-size: 12px; font-family: 'ahem'">
+            <img src="pattern.png" style="width: 40px; vertical-align: middle"
+            ><img src="pattern.png" style="width: 60px"></span>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2299,22 +2556,20 @@ def test_vertical_align():
     assert img_1.height == 40
     assert img_2.height == 60
     # middle of the image (position_y + 20) is at half the ex-height above
-    # the baseline of the parent. Currently the ex-height is 0.5em
-    # TODO: update this when we actually get ex form the font metrics
-    assert img_1.position_y == 37  # 60 - 0.5 * 0.5 * font-size - 40/2
+    # the baseline of the parent. The ex-height of Ahem is something like 0.8em
+    assert img_1.position_y == 35.2  # 60 - 0.5 * 0.8 * font-size - 40/2
     assert img_2.position_y == 0
-    assert line.height == 77
+    assert line.height == 75.2
     assert body.height == line.height
 
     # sup and sub currently mean +/- 0.5 em
     # With the initial 16px font-size, that’s 8px.
     page, = parse('''
         <span style="line-height: 10px">
-            <img src="pattern.png" style="width: 60px">
-            <img src="pattern.png" style="width: 40px; vertical-align: super">
-            <img src="pattern.png" style="width: 40px; vertical-align: sub">
-        </span>
-    ''')
+            <img src="pattern.png" style="width: 60px"
+            ><img src="pattern.png" style="width: 40px; vertical-align: super"
+            ><img src="pattern.png" style="width: 40px; vertical-align: sub"
+        ></span>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2332,10 +2587,9 @@ def test_vertical_align():
     page, = parse('''
         <body style="line-height: 10px">
             <span>
-                <img src="pattern.png" style="vertical-align: text-top">
-                <img src="pattern.png" style="vertical-align: text-bottom">
-            </span>
-    ''')
+                <img src="pattern.png" style="vertical-align: text-top"
+                ><img src="pattern.png" style="vertical-align: text-bottom"
+            ></span>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2368,24 +2622,22 @@ def test_vertical_align():
 
     page, = parse('''
         <span>
-            <img src="pattern.png" style="width: 40px; vertical-align: -15px">
-            <img src="pattern.png" style="width: 60px">
-        </span>
-        <div style="display: inline-block; vertical-align: 3px">
+            <img src="pattern.png" style="width: 40px; vertical-align: -15px"
+            ><img src="pattern.png" style="width: 60px"
+        ></span><div style="display: inline-block; vertical-align: 3px">
             <div>
                 <div style="height: 100px">foo</div>
                 <div>
                     <img src="pattern.png" style="
-                        width: 40px; vertical-align: -15px">
-                    <img src="pattern.png" style="width: 60px">
-                </div>
+                        width: 40px; vertical-align: -15px"
+                    ><img src="pattern.png" style="width: 60px"
+                ></div>
             </div>
-        </div>
-    ''')
+        </div>''')
     html, = page.children
     body, = html.children
     line, = body.children
-    span, _, div_1 = line.children  # _ is white space
+    span, div_1 = line.children
     assert line.height == 178
     assert body.height == line.height
 
@@ -2425,8 +2677,7 @@ def test_vertical_align():
             <span style="vertical-align: bottom">
                 <img src="pattern.png" style="vertical-align: 6px">
             </span>
-        </span>
-    ''')
+        </span>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2457,6 +2708,34 @@ def test_vertical_align():
     assert img_1.position_y == 96
     assert img_2.position_y == 0
 
+    # Reference for the next test
+    page, = parse('''
+        <span style="font-size: 0; vertical-align: top">
+            <img src="pattern.png">
+        </span>
+    ''')
+    html, = page.children
+    body, = html.children
+    line, = body.children
+    span, = line.children
+    img_1, = span.children
+    assert img_1.position_y == 0
+
+    # Should be the same as above
+    page, = parse('''
+        <span style="font-size: 0; vertical-align: top; display: inline-block">
+            <img src="pattern.png">
+        </span>''')
+    html, = page.children
+    body, = html.children
+    line_1, = body.children
+    span, = line_1.children
+    line_2, = span.children
+    img_1, = line_2.children
+    assert img_1.element_tag == 'img'
+    assert img_1.position_y == 0
+
+
 @assert_no_logs
 def test_text_align_left():
     """Test the left text alignment."""
@@ -2476,9 +2755,8 @@ def test_text_align_left():
             @page { size: 200px }
         </style>
         <body>
-            <img src="pattern.png" style="width: 40px">
-            <img src="pattern.png" style="width: 60px">
-    ''')
+            <img src="pattern.png" style="width: 40px"
+            ><img src="pattern.png" style="width: 60px">''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2509,9 +2787,8 @@ def test_text_align_right():
             body { text-align: right }
         </style>
         <body>
-            <img src="pattern.png" style="width: 40px">
-            <img src="pattern.png" style="width: 60px">
-    ''')
+            <img src="pattern.png" style="width: 40px"
+            ><img src="pattern.png" style="width: 60px">''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2541,9 +2818,8 @@ def test_text_align_center():
             body { text-align: center }
         </style>
         <body>
-            <img src="pattern.png" style="width: 40px">
-            <img src="pattern.png" style="width: 60px">
-    ''')
+            <img src="pattern.png" style="width: 40px"
+            ><img src="pattern.png" style="width: 60px">''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2560,14 +2836,13 @@ def test_text_align_justify():
             @page { size: 300px 1000px }
             body { text-align: justify }
         </style>
-        <p><img src="pattern.png" style="width: 40px"> &#20;
-           <strong>
-                <img src="pattern.png" style="width: 60px"> &#20;
-                <img src="pattern.png" style="width: 10px"> &#20;
-                <img src="pattern.png" style="width: 100px">
-           </strong><img src="pattern.png" style="width: 290px">
-            <!-- Last image will be on its own line. -->
-    ''')
+        <p><img src="pattern.png" style="width: 40px">
+            <strong>
+                <img src="pattern.png" style="width: 60px">
+                <img src="pattern.png" style="width: 10px">
+                <img src="pattern.png" style="width: 100px"
+            ></strong><img src="pattern.png" style="width: 290px"
+            ><!-- Last image will be on its own line. -->''')
     html, = page.children
     body, = html.children
     paragraph, = body.children
@@ -2613,8 +2888,7 @@ def test_word_spacing():
     # (Not a string.)
     page, = parse('''
         <style></style>
-        <body><strong>Lorem ipsum dolor<em>sit amet</em></strong>
-    ''')
+        <body><strong>Lorem ipsum dolor<em>sit amet</em></strong>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2625,8 +2899,7 @@ def test_word_spacing():
     # of a TextBox. Is this what we want?
     page, = parse('''
         <style>strong { word-spacing: 11px }</style>
-        <body><strong>Lorem ipsum dolor<em>sit amet</em></strong>
-    ''')
+        <body><strong>Lorem ipsum dolor<em>sit amet</em></strong>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2638,8 +2911,7 @@ def test_word_spacing():
 def test_letter_spacing():
     """Test letter-spacing."""
     page, = parse('''
-        <body><strong>Supercalifragilisticexpialidocious</strong>
-    ''')
+        <body><strong>Supercalifragilisticexpialidocious</strong>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2648,8 +2920,7 @@ def test_letter_spacing():
 
     page, = parse('''
         <style>strong { letter-spacing: 11px }</style>
-        <body><strong>Supercalifragilisticexpialidocious</strong>
-    ''')
+        <body><strong>Supercalifragilisticexpialidocious</strong>''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2689,9 +2960,7 @@ def test_inline_replaced_auto_margins():
             @page { size: 200px }
             img { display: inline; margin: auto; width: 50px }
         </style>
-        <body>
-          <img src="pattern.png" />
-    ''')
+        <body><img src="pattern.png" />''')
     html, = page.children
     body, = html.children
     line, = body.children
@@ -2710,8 +2979,7 @@ def test_empty_inline_auto_margins():
             @page { size: 200px }
             span { margin: auto }
         </style>
-        <body><span></span>
-    ''')
+        <body><span></span>''')
     html, = page.children
     body, = html.children
     block, = body.children
@@ -2812,8 +3080,8 @@ def test_table_column_width():
     with capture_logs() as logs:
         page, = parse(source)
     assert len(logs) == 1
-    assert logs[0] == ('WARNING: This table row has more columns than '
-                       'the table, ignored 1 cells: (<TableCellBox td 25>,)')
+    assert logs[0].startswith('WARNING: This table row has more columns than '
+                              'the table, ignored 1 cell')
     html, = page.children
     body, = html.children
     wrapper, = body.children
@@ -2898,8 +3166,7 @@ def test_table_column_width():
     assert row.children[0].width == 500
     assert row.children[1].width == 600
     assert row.children[2].width == 0
-    assert table.width == 1500 # 500 + 600 + 4 * border-spacing
-
+    assert table.width == 1500  # 500 + 600 + 4 * border-spacing
 
     # Sum of columns width larger that the table width:
     # increase the table width
@@ -2934,13 +3201,13 @@ def test_table_row_height():
         <table style="width: 1000px; border-spacing: 0 100px;
                       font: 20px/1em serif; margin: 3px; table-layout: fixed">
             <tr>
-                <td rowspan=0 style="height: 420px; vertical-align: top">
-                <td>X<br>X<br>X
-                <td><table style="margin-top: 20px;
-                                  border-spacing: 0">X</table>
-                <td style="vertical-align: top">X
-                <td style="vertical-align: middle">X
-                <td style="vertical-align: bottom">X
+                <td rowspan=0 style="height: 420px; vertical-align: top"></td>
+                <td>X<br>X<br>X</td>
+                <td><table style="margin-top: 20px; border-spacing: 0">
+                    <tr><td>X</td></tr></table></td>
+                <td style="vertical-align: top">X</td>
+                <td style="vertical-align: middle">X</td>
+                <td style="vertical-align: bottom">X</td>
             </tr>
             <tr>
                 <!-- cells with no text (no line boxes) is a corner case
@@ -2950,7 +3217,7 @@ def test_table_row_height():
             </tr>
             <tr></tr>
             <tr>
-                <td style="vertical-align: bottom">
+                <td style="vertical-align: bottom"></td>
             </tr>
         </table>
     ''')
@@ -3046,7 +3313,6 @@ def test_table_wrapper():
     assert body.width == 1000
     assert wrapper.width == 600  # Not counting borders or padding
     assert wrapper.margin_left == 100
-    assert wrapper.margin_right == 300  # To fill the 1000px of the container
     assert table.margin_width() == 600
     assert table.width == 578  # 600 - 2*10 - 2*1, no margin
     # box-sizing in the UA stylesheet  makes `height: 500px` set this
@@ -3137,7 +3403,7 @@ def test_margin_boxes_fixed_dimension():
     assert margin_box.margin_width() == 200
     assert margin_box.margin_left == 60
     assert margin_box.margin_right == 60
-    assert margin_box.width == 80 # 200 - 60 - 60
+    assert margin_box.width == 80  # 200 - 60 - 60
 
     assert margin_box.margin_height() == 100
     # total was too big, the outside margin was ignored:
@@ -3283,25 +3549,62 @@ def test_margin_boxes_fixed_dimension():
 @assert_no_logs
 def test_preferred_widths():
     """Unit tests for preferred widths."""
-    document = parse('''
-        <p style="white-space: pre-line">
-            Lorem ipsum dolor sit amet,
-              consectetur elit
-        </p>
-                   <!--  ^  No-break space here  -->
-    ''', return_document=True)
-    # Non-laid-out boxes:
-    body, = document.formatting_structure.children
-    paragraph, = body.children
-    line, = paragraph.children
-    text, = line.children
-    assert text.text == '\nLorem ipsum dolor sit amet,\nconsectetur elit\n'
-
-    minimum = inline_preferred_minimum_width(document, line)
-    preferred = inline_preferred_width(document, line)
+    def get_float_width(body_width):
+        page, = parse('''
+            <body style="width: %spx">
+            <p style="white-space: pre-line; float: left">
+                Lorem ipsum dolor sit amet,
+                  consectetur elit
+            </p>
+                       <!--  ^  No-break space here  -->
+        ''' % body_width)
+        html, = page.children
+        body, = html.children
+        paragraph, = body.children
+        return paragraph.width
     # Not exact, depends on the installed fonts
-    assert 120 < minimum < 140
-    assert 220 < preferred < 240
+    # Preferred minimum width:
+    assert 120 < get_float_width(10) < 140
+    # Preferred width:
+    assert 220 < get_float_width(10000) < 240
+
+    # Non-regression test:
+    # Incorrect whitespace handling in preferred width used to cause
+    # unnecessary line break.
+    page, = parse('''
+        <p style="float: left">Lorem <em>ipsum</em> dolor.</p>
+    ''')
+    html, = page.children
+    body, = html.children
+    paragraph, = body.children
+    assert len(paragraph.children) == 1
+    assert isinstance(paragraph.children[0], boxes.LineBox)
+
+    page, = parse('''
+        <style>img { width: 20px }</style>
+        <p style="float: left">
+            <img src=pattern.png><img src=pattern.png><br>
+            <img src=pattern.png></p>
+    ''')
+    html, = page.children
+    body, = html.children
+    paragraph, = body.children
+    assert paragraph.width == 40
+
+    page, = parse('''<style>p { font: 20px Ahem }</style>
+                     <p style="float: left">XX<br>XX<br>X</p>''')
+    html, = page.children
+    body, = html.children
+    paragraph, = body.children
+    assert paragraph.width == 40
+
+    # The space is the start of the line is collapsed.
+    page, = parse('''<style>p { font: 20px Ahem }</style>
+                     <p style="float: left">XX<br> XX<br>X</p>''')
+    html, = page.children
+    body, = html.children
+    paragraph, = body.children
+    assert paragraph.width == 40
 
 
 @assert_no_logs
@@ -3431,7 +3734,7 @@ def test_margin_boxes_variable_dimension():
     ''' % images(170, 175)
     assert get_widths(css) == [200, 300, 175]
 
-    ##### Without @top-center
+    # Without @top-center
 
     css = '''
         @top-left { content: ''; width: 200px }
@@ -4015,6 +4318,26 @@ def test_absolute_images():
 
 
 @assert_no_logs
+def test_fixed_positioning():
+    # TODO:test page-break-before: left/right
+    page_1, page_2, page_3 = parse('''
+        a
+        <div style="page-break-before: always; page-break-after: always">
+            <p style="position: fixed">b</p>
+        </div>
+        c
+    ''')
+    html, = page_1.children
+    assert [c.element_tag for c in html.children] == ['body', 'p']
+    html, = page_2.children
+    body, = html.children
+    div, = body.children
+    assert [c.element_tag for c in div.children] == ['p']
+    html, = page_3.children
+    assert [c.element_tag for c in html.children] == ['p', 'body']
+
+
+@assert_no_logs
 def test_floats():
     # adjacent-floats-001
     page, = parse('''
@@ -4023,8 +4346,7 @@ def test_floats():
             img { width: 100px; vertical-align: top }
         </style>
         <div><img src=pattern.png /></div>
-        <div><img src=pattern.png /></div>
-    ''')
+        <div><img src=pattern.png /></div>''')
     html, = page.children
     body, = html.children
     div_1, div_2 = body.children
@@ -4041,9 +4363,8 @@ def test_floats():
         <div><img src=pattern.png /><!-- 1 --></div>
         <div><img src=pattern.png /><!-- 2 --></div>
         <div><img src=pattern.png /><!-- 4 --></div>
-        <img src=pattern.png /><!-- 3 -->
-        <img src=pattern.png /><!-- 5 -->
-    ''')
+        <img src=pattern.png /><!-- 3
+        --><img src=pattern.png /><!-- 5 -->''')
     html, = page.children
     body, = html.children
     div_1, div_2, div_4, anon_block = body.children
@@ -4103,6 +4424,25 @@ def test_floats():
     assert (line_1.position_x, line_1.position_y) == (20, 0)
     assert (line_2.position_x, line_2.position_y) == (0, 200)
 
+    # c414-flt-wrap-000 with text ... more or less
+    page, = parse('''
+        <style>
+            body { width: 100px; font: 60px Ahem; }
+            p { float: left; height: 100px }
+            img { width: 60px; vertical-align: top }
+        </style>
+        <p style="width: 20px"></p>
+        <p style="width: 100%"></p>
+        A B
+    ''')
+    html, = page.children
+    body, = html.children
+    p_1, p_2, anon_block = body.children
+    line_1, line_2 = anon_block.children
+    assert anon_block.position_y == 0
+    assert (line_1.position_x, line_1.position_y) == (20, 0)
+    assert (line_2.position_x, line_2.position_y) == (0, 200)
+
     # floats-placement-vertical-001b
     page, = parse('''
         <style>
@@ -4146,3 +4486,803 @@ def test_floats():
     assert outer_area(img_1) == (0, 0, 50, 50)
     assert outer_area(img_2) == (30, 50, 50, 50)
     assert outer_area(img_3) == (0, 50, 30, 30)
+
+    # Floats do no affect other pages
+    page_1, page_2 = parse('''
+        <style>
+            body { width: 90px; font-size: 0 }
+            img { vertical-align: top }
+        </style>
+        <body>
+        <img src=pattern.png style="float: left; width: 30px" />
+        <img src=pattern.png style="width: 50px" />
+        <div style="page-break-before: always"></div>
+        <img src=pattern.png style="width: 50px" />
+    ''')
+    html, = page_1.children
+    body, = html.children
+    float_img, anon_block, = body.children
+    line, = anon_block.children
+    img_1, = line.children
+    assert outer_area(float_img) == (0, 0, 30, 30)
+    assert outer_area(img_1) == (30, 0, 50, 50)
+
+    html, = page_2.children
+    body, = html.children
+    div, anon_block = body.children
+    line, = anon_block.children
+    img_2, = line.children
+    assert outer_area(img_2) == (0, 0, 50, 50)
+
+
+@assert_no_logs
+def test_floats_page_breaks():
+    """Tests the page breaks when floated boxes
+    do not fit the page."""
+
+    # Tests floated images shorter than the page
+    pages = parse('''
+        <style>
+            @page { size: 100px; margin: 10px }
+            img { height: 45px; width:70px; float: left;}
+        </style>
+        <body>
+            <img src=pattern.png>
+                    <!-- page break should be here !!! -->
+            <img src=pattern.png>
+    ''')
+
+    assert len(pages) == 2
+
+    page_images = []
+    for page in pages:
+        images = [d for d in page.descendants() if d.element_tag == 'img']
+        assert all([img.element_tag == 'img' for img in images])
+        assert all([img.position_x == 10 for img in images])
+        page_images.append(images)
+        del images
+    positions_y = [[img.position_y for img in images]
+                   for images in page_images]
+    assert positions_y == [[10], [10]]
+
+    # Tests floated images taller than the page
+    pages = parse('''
+        <style>
+            @page { size: 100px; margin: 10px }
+            img { height: 81px; width:70px; float: left;}
+        </style>
+        <body>
+            <img src=pattern.png>
+                    <!-- page break should be here !!! -->
+            <img src=pattern.png>
+    ''')
+
+    assert len(pages) == 2
+
+    page_images = []
+    for page in pages:
+        images = [d for d in page.descendants() if d.element_tag == 'img']
+        assert all([img.element_tag == 'img' for img in images])
+        assert all([img.position_x == 10 for img in images])
+        page_images.append(images)
+        del images
+    positions_y = [[img.position_y for img in images]
+                   for images in page_images]
+    assert positions_y == [[10], [10]]
+
+    # Tests floated images shorter than the page
+    pages = parse('''
+        <style>
+            @page { size: 100px; margin: 10px }
+            img { height: 30px; width:70px; float: left;}
+        </style>
+        <body>
+            <img src=pattern.png>
+            <img src=pattern.png>
+                    <!-- page break should be here !!! -->
+            <img src=pattern.png>
+            <img src=pattern.png>
+                    <!-- page break should be here !!! -->
+            <img src=pattern.png>
+    ''')
+
+    assert len(pages) == 3
+
+    page_images = []
+    for page in pages:
+        images = [d for d in page.descendants() if d.element_tag == 'img']
+        assert all([img.element_tag == 'img' for img in images])
+        assert all([img.position_x == 10 for img in images])
+        page_images.append(images)
+        del images
+    positions_y = [[img.position_y for img in images]
+                   for images in page_images]
+    assert positions_y == [[10, 40], [10, 40], [10]]
+
+    # last float does not fit, pushed to next page
+    pages = parse('''
+        <style>
+            @page{
+                size: 110px;
+                margin: 10px;
+                padding: 0;
+            }
+            .large {
+                width: 10px;
+                height: 60px;
+            }
+            .small {
+                width: 10px;
+                height: 20px;
+            }
+        </style>
+        <body>
+            <div class="large"></div>
+            <div class="small"></div>
+            <div class="large"></div>
+    ''')
+
+    assert len(pages) == 2
+    page_divs = []
+    for page in pages:
+        divs = [div for div in page.descendants() if div.element_tag == 'div']
+        assert all([div.element_tag == 'div' for div in divs])
+        page_divs.append(divs)
+        del divs
+
+    positions_y = [[div.position_y for div in divs] for divs in page_divs]
+    assert positions_y == [[10, 70], [10]]
+
+    # last float does not fit, pushed to next page
+    # center div must not
+    pages = parse('''
+        <style>
+            @page{
+                size: 110px;
+                margin: 10px;
+                padding: 0;
+            }
+            .large {
+                width: 10px;
+                height: 60px;
+            }
+            .small {
+                width: 10px;
+                height: 20px;
+                page-break-after: avoid;
+            }
+        </style>
+        <body>
+            <div class="large"></div>
+            <div class="small"></div>
+            <div class="large"></div>
+    ''')
+
+    assert len(pages) == 2
+    page_divs = []
+    for page in pages:
+        divs = [div for div in page.descendants() if div.element_tag == 'div']
+        assert all([div.element_tag == 'div' for div in divs])
+        page_divs.append(divs)
+        del divs
+
+    positions_y = [[div.position_y for div in divs] for divs in page_divs]
+    assert positions_y == [[10], [10, 30]]
+
+    # center div must be the last element,
+    # but float won't fit and will get pushed anyway
+    pages = parse('''
+        <style>
+            @page{
+                size: 110px;
+                margin: 10px;
+                padding: 0;
+            }
+            .large {
+                width: 10px;
+                height: 80px;
+            }
+            .small {
+                width: 10px;
+                height: 20px;
+                page-break-after: avoid;
+            }
+        </style>
+        <body>
+            <div class="large"></div>
+            <div class="small"></div>
+            <div class="large"></div>
+    ''')
+
+    assert len(pages) == 3
+    page_divs = []
+    for page in pages:
+        divs = [div for div in page.descendants() if div.element_tag == 'div']
+        assert all([div.element_tag == 'div' for div in divs])
+        page_divs.append(divs)
+        del divs
+
+    positions_y = [[div.position_y for div in divs] for divs in page_divs]
+    assert positions_y == [[10], [10], [10]]
+
+
+@assert_no_logs
+def test_font_stretch():
+    page, = parse('''
+        <style>p { float: left }</style>
+        <p>Hello, world!</p>
+        <p style="font-stretch: semi-condensed">Hello, world!</p>
+        <p style="font-stretch: semi-expanded">Hello, world!</p>
+    ''')
+    html, = page.children
+    body, = html.children
+    p_1, p_2, p_3 = body.children
+    normal = p_1.width
+    condensed = p_2.width
+    assert condensed < normal
+    # TODO: when @font-face is supported use a font with an expanded variant.
+#    expanded = p_3.width
+#    assert normal < expanded
+
+
+@assert_no_logs
+def test_box_decoration_break():
+    # http://www.w3.org/TR/css3-background/#the-box-decoration-break
+    # Property not implemented yet, always "slice".
+    page_1, page_2 = parse('''
+        <style>
+            @page { size: 100px }
+            p { padding: 2px; border: 3px solid; margin: 5px }
+            img { height: 40px; vertical-align: top }
+        </style>
+        <p>
+            <img src=pattern.png><br>
+            <img src=pattern.png><br>
+            <img src=pattern.png><br>
+            <img src=pattern.png><br>''')
+    html, = page_1.children
+    body, = html.children
+    paragraph, = body.children
+    line_1, line_2 = paragraph.children
+    assert paragraph.position_y == 0
+    assert paragraph.margin_top == 5
+    assert paragraph.border_top_width == 3
+    assert paragraph.padding_top == 2
+    assert paragraph.content_box_y() == 10
+    assert line_1.position_y == 10
+    assert line_2.position_y == 50
+    assert paragraph.height == 80
+    assert paragraph.margin_bottom == 0
+    assert paragraph.border_bottom_width == 0
+    assert paragraph.padding_bottom == 0
+    assert paragraph.margin_height() == 90
+
+    html, = page_2.children
+    body, = html.children
+    paragraph, = body.children
+    line_1, line_2 = paragraph.children
+    assert paragraph.position_y == 0
+    assert paragraph.margin_top == 0
+    assert paragraph.border_top_width == 0
+    assert paragraph.padding_top == 0
+    assert paragraph.content_box_y() == 0
+    assert line_1.position_y == 0
+    assert line_2.position_y == 40
+    assert paragraph.height == 80
+    assert paragraph.padding_bottom == 2
+    assert paragraph.border_bottom_width == 3
+    assert paragraph.margin_bottom == 5
+    assert paragraph.margin_height() == 90
+
+
+@assert_no_logs
+def test_hyphenation():
+    def line_count(source):
+        page, = parse('<html style="width: 5em">' + source)
+        html, = page.children
+        body, = html.children
+        lines = body.children
+        return len(lines)
+
+    # Default: no hyphenation
+    assert line_count('<body>hyphenation') == 1
+    # lang only: no hyphenation
+    assert line_count(
+        '<body lang=en>hyphenation') == 1
+    # `hyphens: auto` only: no hyphenation
+    assert line_count(
+        '<body style="-weasy-hyphens: auto">hyphenation') == 1
+    # lang + `hyphens: auto`: hyphenation
+    assert line_count(
+        '<body style="-weasy-hyphens: auto" lang=en>hyphenation') > 1
+
+    # Hyphenation with soft hyphens
+    assert line_count('<body>hyp&shy;henation') == 2
+    # … unless disabled
+    assert line_count(
+        '<body style="-weasy-hyphens: none">hyp&shy;henation') == 1
+
+
+@assert_no_logs
+def test_hyphenate_character():
+    page, = parse(
+        '<html style="width: 5em">'
+        '<body style="-weasy-hyphens: auto;'
+        '-weasy-hyphenate-character: \'!\'" lang=en>'
+        'hyphenation')
+    html, = page.children
+    body, = html.children
+    lines = body.children
+    assert len(lines) > 1
+    assert lines[0].children[0].text.endswith('!')
+    full_text = ''.join(line.children[0].text for line in lines)
+    assert full_text.replace('!', '') == 'hyphenation'
+
+    page, = parse(
+        '<html style="width: 5em">'
+        '<body style="-weasy-hyphens: auto;'
+        '-weasy-hyphenate-character: \'é\'" lang=en>'
+        'hyphenation')
+    html, = page.children
+    body, = html.children
+    lines = body.children
+    assert len(lines) > 1
+    assert lines[0].children[0].text.endswith('é')
+    full_text = ''.join(line.children[0].text for line in lines)
+    assert full_text.replace('é', '') == 'hyphenation'
+
+    page, = parse(
+        '<html style="width: 5em">'
+        '<body style="-weasy-hyphens: auto;'
+        '-weasy-hyphenate-character: \'ù ù\'" lang=en>'
+        'hyphenation')
+    html, = page.children
+    body, = html.children
+    lines = body.children
+    assert len(lines) > 1
+    assert lines[0].children[0].text.endswith('ù ù')
+    full_text = ''.join(line.children[0].text for line in lines)
+    assert full_text.replace(' ', '').replace('ù', '') == 'hyphenation'
+
+    page, = parse(
+        '<html style="width: 5em">'
+        '<body style="-weasy-hyphens: auto;'
+        '-weasy-hyphenate-character: \'\'" lang=en>'
+        'hyphenation')
+    html, = page.children
+    body, = html.children
+    lines = body.children
+    assert len(lines) > 1
+    full_text = ''.join(line.children[0].text for line in lines)
+    assert full_text == 'hyphenation'
+
+    # TODO: strange error with some characters
+    # page, = parse(
+    #     '<html style="width: 5em">'
+    #     '<body style="-weasy-hyphens: auto;'
+    #     '-weasy-hyphenate-character: \'———\'" lang=en>'
+    #     'hyphenation')
+    # html, = page.children
+    # body, = html.children
+    # lines = body.children
+    # assert len(lines) > 1
+    # assert lines[0].children[0].text.endswith('———')
+    # full_text = ''.join(line.children[0].text for line in lines)
+    # assert full_text.replace('—', '') == 'hyphenation'
+
+
+@assert_no_logs
+def test_hyphenate_limit_zone():
+    page, = parse(
+        '<html style="width: 10em">'
+        '<body style="-weasy-hyphens: auto;'
+        '-weasy-hyphenate-limit-zone: 0" lang=en>'
+        'mmmmm hyphenation')
+    html, = page.children
+    body, = html.children
+    lines = body.children
+    assert len(lines) == 2
+    assert lines[0].children[0].text.endswith('‐')
+    full_text = ''.join(line.children[0].text for line in lines)
+    assert full_text.replace('‐', '') == 'mmmmm hyphenation'
+
+    page, = parse(
+        '<html style="width: 10em">'
+        '<body style="-weasy-hyphens: auto;'
+        '-weasy-hyphenate-limit-zone: 9em" lang=en>'
+        'mmmmm hyphenation')
+    html, = page.children
+    body, = html.children
+    lines = body.children
+    assert len(lines) > 1
+    assert lines[0].children[0].text.endswith('mm')
+    full_text = ''.join(line.children[0].text for line in lines)
+    assert full_text == 'mmmmmhyphenation'
+
+    page, = parse(
+        '<html style="width: 10em">'
+        '<body style="-weasy-hyphens: auto;'
+        '-weasy-hyphenate-limit-zone: 5%" lang=en>'
+        'mmmmm hyphenation')
+    html, = page.children
+    body, = html.children
+    lines = body.children
+    assert len(lines) == 2
+    assert lines[0].children[0].text.endswith('‐')
+    full_text = ''.join(line.children[0].text for line in lines)
+    assert full_text.replace('‐', '') == 'mmmmm hyphenation'
+
+    page, = parse(
+        '<html style="width: 10em">'
+        '<body style="-weasy-hyphens: auto;'
+        '-weasy-hyphenate-limit-zone: 95%" lang=en>'
+        'mmmmm hyphenation')
+    html, = page.children
+    body, = html.children
+    lines = body.children
+    assert len(lines) > 1
+    assert lines[0].children[0].text.endswith('mm')
+    full_text = ''.join(line.children[0].text for line in lines)
+    assert full_text == 'mmmmmhyphenation'
+
+
+@assert_no_logs
+def test_hyphenate_limit_chars():
+    def line_count(limit_chars):
+        page, = parse((
+            '<html style="width: 1em">'
+            '<body style="-weasy-hyphens: auto;'
+            '-weasy-hyphenate-limit-chars: %s" lang=en>'
+            'hyphen') % limit_chars)
+        html, = page.children
+        body, = html.children
+        lines = body.children
+        return len(lines)
+
+    assert line_count('auto') == 2
+    assert line_count('auto auto 0') == 2
+    assert line_count('0 0 0') == 2
+    assert line_count('4 4 auto') == 1
+    assert line_count('6 2 4') == 2
+    assert line_count('auto 1 auto') == 2
+    assert line_count('7 auto auto') == 1
+    assert line_count('6 auto auto') == 2
+    assert line_count('5 2') == 2
+    assert line_count('3') == 2
+    assert line_count('2 4 6') == 1
+    assert line_count('auto 4') == 1
+    assert line_count('auto 2') == 2
+
+
+@assert_no_logs
+def test_overflow_wrap():
+    def get_lines(wrap, text):
+        page, = parse('''
+            <style>
+                body {width: 80px; overflow: hidden; font-family: ahem; }
+                span {overflow-wrap: %s; white-space: normal; }
+            </style>
+            <body style="-weasy-hyphens: auto;" lang="en">
+                <span>%s
+        ''' % (wrap, text))
+        html, = page.children
+        body, = html.children
+        body_lines = []
+        for line in body.children:
+            box, = line.children
+            textBox, = box.children
+            body_lines.append(textBox.text)
+        return body_lines
+
+    # break-word
+    lines = get_lines('break-word', 'aaaaaaaa')
+    assert len(lines) > 1
+    full_text = ''.join(line for line in lines)
+    assert full_text == 'aaaaaaaa'
+
+    # normal
+    lines = get_lines('normal', 'aaaaaaaa')
+    assert len(lines) == 1
+    full_text = ''.join(line for line in lines)
+    assert full_text == 'aaaaaaaa'
+
+    # break-word after hyphenation
+    lines = get_lines('break-word', 'hyphenations')
+    assert len(lines) > 3
+    full_text = ''.join(line for line in lines)
+    assert full_text == "hy\u2010phen\u2010ations"
+
+    # break word after normal white-space wrap and hyphenation
+    lines = get_lines(
+        'break-word', "A splitted word.  An hyphenated word.")
+    assert len(lines) > 8
+    full_text = ''.join(line for line in lines)
+    assert full_text == "Asplittedword.Anhy\u2010phen\u2010atedword."
+
+
+@assert_no_logs
+def test_white_space():
+    """Test the white-space property."""
+    def lines(width, space):
+        page, = parse('''
+            <style>
+              body { font-size: 100px; width: %ipx }
+              span { white-space: %s }
+            </style>
+            <body><span>This    \n    is text''' % (width, space))
+        html, = page.children
+        body, = html.children
+        return body.children
+
+    line1, line2, line3 = lines(1, 'normal')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This'
+    box2, = line2.children
+    text2, = box2.children
+    assert text2.text == 'is'
+    box3, = line3.children
+    text3, = box3.children
+    assert text3.text == 'text'
+
+    line1, line2 = lines(1, 'pre')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This\xA0\xA0\xA0\xA0'
+    box2, = line2.children
+    text2, = box2.children
+    assert text2.text == '\xA0\xA0\xA0\xA0is\xA0text'
+
+    line1, = lines(1, 'nowrap')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This\xA0is\xA0text'
+
+    line1, line2, line3, line4 = lines(1, 'pre-wrap')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This\xA0\xA0\xA0\xA0\u200b'
+    box2, = line2.children
+    text2, = box2.children
+    assert text2.text == '\xA0\xA0\xA0\xA0\u200b'
+    box3, = line3.children
+    text3, = box3.children
+    assert text3.text == 'is\xA0\u200b'
+    box4, = line4.children
+    text4, = box4.children
+    assert text4.text == 'text'
+
+    line1, line2, line3 = lines(1, 'pre-line')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This'
+    box2, = line2.children
+    text2, = box2.children
+    assert text2.text == 'is'
+    box3, = line3.children
+    text3, = box3.children
+    assert text3.text == 'text'
+
+    line1, = lines(1000000, 'normal')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This is text'
+
+    line1, line2 = lines(1000000, 'pre')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This\xA0\xA0\xA0\xA0'
+    box2, = line2.children
+    text2, = box2.children
+    assert text2.text == '\xA0\xA0\xA0\xA0is\xA0text'
+
+    line1, = lines(1000000, 'nowrap')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This\xA0is\xA0text'
+
+    line1, line2 = lines(1000000, 'pre-wrap')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This\xA0\xA0\xA0\xA0\u200b'
+    box2, = line2.children
+    text2, = box2.children
+    assert text2.text == '\xA0\xA0\xA0\xA0\u200bis\xA0\u200btext'
+
+    line1, line2 = lines(1000000, 'pre-line')
+    box1, = line1.children
+    text1, = box1.children
+    assert text1.text == 'This'
+    box2, = line2.children
+    text2, = box2.children
+    assert text2.text == 'is text'
+
+
+@assert_no_logs
+def test_linear_gradient():
+    red = (1, 0, 0, 1)
+    lime = (0, 1, 0, 1)
+    blue = (0, 0, 1, 1)
+
+    def layout(gradient_css, type_='linear', init=(),
+               positions=[0, 1], colors=[blue, lime], scale=(1, 1)):
+        page, = parse('<style>@page { background: ' + gradient_css)
+        layer, = page.background.layers
+        scale_x, scale_y = scale
+        result = layer.image.layout(
+            400, 300, lambda dx, dy: (dx * scale_x, dy * scale_y))
+        expected = 1, type_, init, positions, colors
+        assert almost_equal(result, expected), (result, expected)
+
+    layout('linear-gradient(blue)', 'solid', blue, [], [])
+    layout('repeating-linear-gradient(blue)', 'solid', blue, [], [])
+    layout('repeating-linear-gradient(blue, lime 1.5px)',
+           'solid', (0, .5, .5, 1), [], [])
+    layout('linear-gradient(blue, lime)', init=(200, 0, 200, 300))
+    layout('repeating-linear-gradient(blue, lime)', init=(200, 0, 200, 300))
+    layout('repeating-linear-gradient(blue, lime 20px)',
+           init=(200, 0, 200, 20))
+    layout('repeating-linear-gradient(blue, lime 20px)',
+           'solid', (0, .5, .5, 1), [], [], scale=(1/20, 1/20))
+
+    layout('linear-gradient(to bottom, blue, lime)', init=(200, 0, 200, 300))
+    layout('linear-gradient(to top, blue, lime)', init=(200, 300, 200, 0))
+    layout('linear-gradient(to right, blue, lime)', init=(0, 150, 400, 150))
+    layout('linear-gradient(to left, blue, lime)', init=(400, 150, 0, 150))
+
+    layout('linear-gradient(to top left, blue, lime)',
+           init=(344, 342, 56, -42))
+    layout('linear-gradient(to top right, blue, lime)',
+           init=(56, 342, 344, -42))
+    layout('linear-gradient(to bottom left, blue, lime)',
+           init=(344, -42, 56, 342))
+    layout('linear-gradient(to bottom right, blue, lime)',
+           init=(56, -42, 344, 342))
+
+    layout('linear-gradient(270deg, blue, lime)', init=(400, 150, 0, 150))
+    layout('linear-gradient(.75turn, blue, lime)', init=(400, 150, 0, 150))
+    layout('linear-gradient(45deg, blue, lime)', init=(25, 325, 375, -25))
+    layout('linear-gradient(.125turn, blue, lime)', init=(25, 325, 375, -25))
+    layout('linear-gradient(.375turn, blue, lime)', init=(25, -25, 375, 325))
+    layout('linear-gradient(.625turn, blue, lime)', init=(375, -25, 25, 325))
+    layout('linear-gradient(.875turn, blue, lime)', init=(375, 325, 25, -25))
+
+    layout('linear-gradient(blue 2em, lime 20%)', init=(200, 32, 200, 60))
+    layout('linear-gradient(blue 100px, red, blue, red 160px, lime)',
+           init=(200, 100, 200, 300), colors=[blue, red, blue, red, lime],
+           positions=[0, .1, .2, .3, 1])
+    layout('linear-gradient(blue -100px, blue 0, red -12px, lime 50%)',
+           init=(200, -100, 200, 150), colors=[blue, blue, red, lime],
+           positions=[0, .4, .4, 1])
+    layout('linear-gradient(blue, blue, red, lime -7px)',
+           init=(200, 0, 200, 100), colors=[blue, blue, red, lime],
+           positions=[0, 0, 0, 0])
+    layout('repeating-linear-gradient(blue, blue, lime, lime -7px)',
+           'solid', (0, .5, .5, 1), [], [])
+
+
+@assert_no_logs
+def test_radial_gradient():
+    red = (1, 0, 0, 1)
+    lime = (0, 1, 0, 1)
+    blue = (0, 0, 1, 1)
+
+    def layout(gradient_css, type_='radial', init=(),
+               positions=[0, 1], colors=[blue, lime], scale_y=1,
+               ctm_scale=(1, 1)):
+        if type_ == 'radial':
+            center_x, center_y, radius0, radius1 = init
+            init = (center_x, center_y / scale_y, radius0,
+                    center_x, center_y / scale_y, radius1)
+        page, = parse('<style>@page { background: ' + gradient_css)
+        layer, = page.background.layers
+        ctm_scale_x, ctm_scale_y = ctm_scale
+        result = layer.image.layout(
+            400, 300, lambda dx, dy: (dx * ctm_scale_x, dy * ctm_scale_y))
+        expected = scale_y, type_, init, positions, colors
+        assert almost_equal(result, expected), (result, expected)
+
+    layout('radial-gradient(blue)', 'solid', blue, [], [])
+    layout('repeating-radial-gradient(blue)', 'solid', blue, [], [])
+    layout('radial-gradient(100px, blue, lime)',
+           init=(200, 150, 0, 100))
+
+    layout('radial-gradient(100px at right 20px bottom 30px, lime, red)',
+           init=(380, 270, 0, 100), colors=[lime, red])
+    layout('radial-gradient(0 0, blue, lime)',
+           init=(200, 150, 0, 1e-7))
+    layout('radial-gradient(1px 0, blue, lime)',
+           init=(200, 150, 0, 1e7), scale_y=1e-14)
+    layout('radial-gradient(0 1px, blue, lime)',
+           init=(200, 150, 0, 1e-7), scale_y=1e14)
+    layout('repeating-radial-gradient(20px 40px, blue, lime)',
+           init=(200, 150, 0, 20), scale_y=40/20)
+    layout('repeating-radial-gradient(20px 40px, blue, lime)',
+           init=(200, 150, 0, 20), scale_y=40/20, ctm_scale=(1/9, 1))
+    layout('repeating-radial-gradient(20px 40px, blue, lime)',
+           init=(200, 150, 0, 20), scale_y=40/20, ctm_scale=(1, 1/19))
+    layout('repeating-radial-gradient(20px 40px, blue, lime)',
+           'solid', (0, .5, .5, 1), [], [], ctm_scale=(1/11, 1))
+    layout('repeating-radial-gradient(20px 40px, blue, lime)',
+           'solid', (0, .5, .5, 1), [], [], ctm_scale=(1, 1/21))
+    layout('repeating-radial-gradient(42px, blue -20px, lime 10px)',
+           init=(200, 150, 10, 40))
+    layout('repeating-radial-gradient(42px, blue -140px, lime -110px)',
+           init=(200, 150, 10, 40))
+    layout('radial-gradient(42px, blue -20px, lime -1px)',
+           'solid', lime, [], [])
+    layout('radial-gradient(42px, blue -20px, lime 0)',
+           'solid', lime, [], [])
+    layout('radial-gradient(42px, blue -20px, lime 20px)',
+           init=(200, 150, 0, 20), colors=[(0, .5, .5, 1), lime])
+
+    layout('radial-gradient(100px 120px, blue, lime)',
+           init=(200, 150, 0, 100), scale_y=120/100)
+    layout('radial-gradient(25% 40%, blue, lime)',
+           init=(200, 150, 0, 100), scale_y=120/100)
+
+    layout('radial-gradient(circle closest-side, blue, lime)',
+           init=(200, 150, 0, 150))
+    layout('radial-gradient(circle closest-side at 150px 50px, blue, lime)',
+           init=(150, 50, 0, 50))
+    layout('radial-gradient(circle closest-side at 45px 50px, blue, lime)',
+           init=(45, 50, 0, 45))
+    layout('radial-gradient(circle closest-side at 420px 50px, blue, lime)',
+           init=(420, 50, 0, 20))
+    layout('radial-gradient(circle closest-side at 420px 281px, blue, lime)',
+           init=(420, 281, 0, 19))
+
+    layout('radial-gradient(closest-side, blue 20%, lime)',
+           init=(200, 150, 40, 200), scale_y=150/200)
+    layout('radial-gradient(closest-side at 300px 20%, blue, lime)',
+           init=(300, 60, 0, 100), scale_y=60/100)
+    layout('radial-gradient(closest-side at 10% 230px, blue, lime)',
+           init=(40, 230, 0, 40), scale_y=70/40)
+
+    layout('radial-gradient(circle farthest-side, blue, lime)',
+           init=(200, 150, 0, 200))
+    layout('radial-gradient(circle farthest-side at 150px 50px, blue, lime)',
+           init=(150, 50, 0, 250))
+    layout('radial-gradient(circle farthest-side at 45px 50px, blue, lime)',
+           init=(45, 50, 0, 355))
+    layout('radial-gradient(circle farthest-side at 420px 50px, blue, lime)',
+           init=(420, 50, 0, 420))
+    layout('radial-gradient(circle farthest-side at 220px 310px, blue, lime)',
+           init=(220, 310, 0, 310))
+
+    layout('radial-gradient(farthest-side, blue, lime)',
+           init=(200, 150, 0, 200), scale_y=150/200)
+    layout('radial-gradient(farthest-side at 300px 20%, blue, lime)',
+           init=(300, 60, 0, 300), scale_y=240/300)
+    layout('radial-gradient(farthest-side at 10% 230px, blue, lime)',
+           init=(40, 230, 0, 360), scale_y=230/360)
+
+    layout('radial-gradient(circle closest-corner, blue, lime)',
+           init=(200, 150, 0, 250))
+    layout('radial-gradient(circle closest-corner at 340px 80px, blue, lime)',
+           init=(340, 80, 0, 100))
+    layout('radial-gradient(circle closest-corner at 0 342px, blue, lime)',
+           init=(0, 342, 0, 42))
+
+    sqrt2 = math.sqrt(2)
+    layout('radial-gradient(closest-corner, blue, lime)',
+           init=(200, 150, 0, 200 * sqrt2), scale_y=150/200)
+    layout('radial-gradient(closest-corner at 450px 100px, blue, lime)',
+           init=(450, 100, 0, 50 * sqrt2), scale_y=100/50)
+    layout('radial-gradient(closest-corner at 40px 210px, blue, lime)',
+           init=(40, 210, 0, 40 * sqrt2), scale_y=90/40)
+
+    layout('radial-gradient(circle farthest-corner, blue, lime)',
+           init=(200, 150, 0, 250))
+    layout('radial-gradient(circle farthest-corner'
+           ' at 300px -100px, blue, lime)',
+           init=(300, -100, 0, 500))
+    layout('radial-gradient(circle farthest-corner at 400px 0, blue, lime)',
+           init=(400, 0, 0, 500))
+
+    layout('radial-gradient(farthest-corner, blue, lime)',
+           init=(200, 150, 0, 200 * sqrt2), scale_y=150/200)
+    layout('radial-gradient(farthest-corner at 450px 100px, blue, lime)',
+           init=(450, 100, 0, 450 * sqrt2), scale_y=200/450)
+    layout('radial-gradient(farthest-corner at 40px 210px, blue, lime)',
+           init=(40, 210, 0, 360 * sqrt2), scale_y=210/360)

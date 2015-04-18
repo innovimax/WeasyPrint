@@ -10,32 +10,10 @@
     http://www.w3.org/TR/CSS21/intro.html#processing-model
 
     This module does this in more than two steps. The
-    :func:`get_all_computed_styles` function does everything, but it itsef
-    calls a function for each step:
+    :func:`get_all_computed_styles` function does everything, but it is itsef
+    based on other functions in this module.
 
-    ``find_stylesheets``
-        Find and parse all author stylesheets in a document.
-
-    ``effective_rules``
-        Resolve @media and @import rules.
-
-    ``match_selectors``
-        Find elements in a document that match a selector list.
-
-    ``find_style_attributes``
-        Find and parse all `style` HTML attributes.
-
-    ``effective_declarations``
-        Remove ignored properties and expand shorthands.
-
-    ``add_property``
-        Take applicable properties and only keep those with highest weight.
-
-    ``set_computed_styles``
-        Handle initial values, inheritance and computed values for one element.
-
-
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
@@ -51,9 +29,10 @@ import lxml.etree
 from . import properties
 from . import computed_values
 from .validation import preprocess_declarations
-from ..urls import get_url_attribute
+from ..urls import (element_base_url, get_url_attribute, url_join,
+                    URLFetchingError)
 from ..logger import LOGGER
-from ..compat import iteritems, urljoin
+from ..compat import iteritems
 from .. import CSS
 
 
@@ -63,20 +42,32 @@ PARSER = tinycss.make_parser('page3')
 # Reject anything not in here:
 PSEUDO_ELEMENTS = (None, 'before', 'after', 'first-line', 'first-letter')
 
-# Selectors for @page rules can have a pseudo-class, one of :first, :left
-# or :right. This maps pseudo-classes to lists of "page types" selected.
+# Selectors for @page rules can have a pseudo-class, one of :first, :left,
+# :right or :blank. This maps pseudo-classes to lists of "page types" selected.
 PAGE_PSEUDOCLASS_TARGETS = {
-    'first': ['first_left_page', 'first_right_page'],
-    'left': ['left_page', 'first_left_page'],
-    'right': ['right_page', 'first_right_page'],
+    'first': [
+        'first_left_page', 'first_right_page',
+        'first_blank_left_page', 'first_blank_right_page'],
+    'left': [
+        'left_page', 'first_left_page',
+        'blank_left_page', 'first_blank_left_page'],
+    'right': [
+        'right_page', 'first_right_page',
+        'blank_right_page', 'first_blank_right_page'],
+    'blank': [
+        'blank_left_page', 'first_blank_left_page',
+        'blank_right_page', 'first_blank_right_page'],
     # no pseudo-class: all pages
-    None: ['left_page', 'right_page', 'first_left_page', 'first_right_page'],
+    None: [
+        'left_page', 'right_page', 'first_left_page', 'first_right_page',
+        'blank_left_page', 'blank_right_page',
+        'first_blank_left_page', 'first_blank_right_page'],
 }
 
 # A test function that returns True if the given property name has an
 # initial value that is not always the same when computed.
 RE_INITIAL_NOT_COMPUTED = re.compile(
-    '^(display|border_[a-z]+_(width|color))$').match
+    '^(display|(border_[a-z]+|outline)_(width|color))$').match
 
 
 class StyleDict(object):
@@ -109,6 +100,10 @@ class StyleDict(object):
 
     def __setitem__(self, key, value):
         self._storage[key] = value
+
+    def get_color(self, key):
+        value = self[key]
+        return value if value != 'currentColor' else self.color
 
     def updated_copy(self, other):
         copy = self.copy()
@@ -145,7 +140,8 @@ class StyleDict(object):
         Non-inherited properties get their initial values.
         This is the styles for an anonymous box.
         """
-        style = computed_from_cascaded(cascaded={}, parent_style=self,
+        style = computed_from_cascaded(
+            cascaded={}, parent_style=self,
             # Only used by non-inherited properties. eg `content: attr(href)`
             element=None)
         object.__setattr__(style, 'anonymous', True)
@@ -155,66 +151,81 @@ class StyleDict(object):
     anonymous = False
 
 
-def find_stylesheets(document, medium):
-    """Yield the stylesheets of ``document``.
+def get_child_text(element):
+    """Return the text directly in the element, not descendants."""
+    content = [element.text] if element.text else []
+    for child in element:
+        if child.tail:
+            content.append(child.tail)
+    return ''.join(content)
 
-    The output order is the same as the order of the dom.
+
+def find_stylesheets(element_tree, device_media_type, url_fetcher):
+    """Yield the stylesheets in ``element_tree``.
+
+    The output order is the same as the source order.
 
     """
-    for element in document.dom.iter():
-        if element.tag not in ('style', 'link'):
-            continue
+    from ..html import element_has_link_type  # Work around circular imports.
+
+    for element in element_tree.iter('style', 'link'):
         mime_type = element.get('type', 'text/css').split(';', 1)[0].strip()
         # Only keep 'type/subtype' from 'type/subtype ; param1; param2'.
         if mime_type != 'text/css':
             continue
         media_attr = element.get('media', '').strip() or 'all'
         media = [media_type.strip() for media_type in media_attr.split(',')]
-        if not evaluate_media_query(media, medium):
+        if not evaluate_media_query(media, device_media_type):
             continue
         if element.tag == 'style':
             # Content is text that is directly in the <style> element, not its
             # descendants
-            content = [element.text or '']
-            for child in element:
-                content.append(child.tail or '')
-            content = ''.join(content)
+            content = get_child_text(element)
             # lxml should give us either unicode or ASCII-only bytestrings, so
             # we don't need `encoding` here.
-            css = CSS(string=content, base_url=element.base_url)
+            css = CSS(string=content, base_url=element_base_url(element),
+                      url_fetcher=url_fetcher, media_type=device_media_type)
             yield css
         elif element.tag == 'link' and element.get('href'):
-            rel = element.get('rel', '').split()
-            if 'stylesheet' not in rel or 'alternate' in rel:
+            if not element_has_link_type(element, 'stylesheet') or \
+                    element_has_link_type(element, 'alternate'):
                 continue
             href = get_url_attribute(element, 'href')
-            yield CSS(url=href, _check_mime_type=True)
+            if href is not None:
+                try:
+                    yield CSS(url=href, url_fetcher=url_fetcher,
+                              _check_mime_type=True,
+                              media_type=device_media_type)
+                except URLFetchingError as exc:
+                    LOGGER.warning('Failed to load stylesheet at %s : %s',
+                                   href, exc)
 
 
-def find_style_attributes(document):
+def find_style_attributes(element_tree):
     """
     Yield ``element, declaration, base_url`` for elements with
     a "style" attribute.
     """
     parser = PARSER
-    for element in document.dom.iter():
+    for element in element_tree.iter():
         style_attribute = element.get('style')
         if style_attribute:
             declarations, errors = parser.parse_style_attr(style_attribute)
             for error in errors:
-                LOGGER.warn(error)
-            yield element, declarations, element.base_url
+                LOGGER.warning(error)
+            yield element, declarations, element_base_url(element)
 
 
-def evaluate_media_query(query_list, medium):
-    """Return the boolean evaluation of `query_list` for the given `medium`.
+def evaluate_media_query(query_list, device_media_type):
+    """Return the boolean evaluation of `query_list` for the given
+    `device_media_type`.
 
     :attr query_list: a cssutilts.stlysheets.MediaList
-    :attr medium: a media type string (for now)
+    :attr device_media_type: a media type string (for now)
 
     """
     # TODO: actual support for media queries, not just media types
-    return 'all' in query_list or medium in query_list
+    return 'all' in query_list or device_media_type in query_list
 
 
 def declaration_precedence(origin, importance):
@@ -286,6 +297,7 @@ def computed_from_cascaded(element, cascaded, parent_style, pseudo_type=None):
         # border-*-color, but they do not apply.
         for side in ('top', 'bottom', 'left', 'right'):
             computed['border_%s_width' % side] = 0
+        computed['outline_width'] = 0
         return computed
 
     # Handle inheritance and initial values
@@ -328,7 +340,7 @@ class Selector(object):
         self.match = match
 
 
-def preprocess_stylesheet(medium, base_url, rules):
+def preprocess_stylesheet(device_media_type, base_url, rules, url_fetcher):
     """Do the work that can be done early on stylesheet, before they are
     in a document.
 
@@ -341,49 +353,66 @@ def preprocess_stylesheet(medium, base_url, rules):
             if declarations:
                 selector_string = rule.selector.as_css()
                 try:
-                    selector_list = [
-                        Selector(
+                    selector_list = []
+                    for selector in cssselect.parse(selector_string):
+                        xpath = selector_to_xpath(selector)
+                        try:
+                            lxml_xpath = lxml.etree.XPath(xpath)
+                        except ValueError as exc:
+                            # TODO: Some characters are not supported by lxml's
+                            # XPath implementation (including control
+                            # characters), but these characters are valid in
+                            # the CSS2.1 specification.
+                            raise cssselect.SelectorError(str(exc))
+                        selector_list.append(Selector(
                             (0,) + selector.specificity(),
-                            selector.pseudo_element,
-                            lxml.etree.XPath(selector_to_xpath(selector)))
-                        for selector in cssselect.parse(selector_string)
-                    ]
+                            selector.pseudo_element, lxml_xpath))
                     for selector in selector_list:
                         if selector.pseudo_element not in PSEUDO_ELEMENTS:
                             raise cssselect.ExpressionError(
                                 'Unknown pseudo-element: %s'
                                 % selector.pseudo_element)
                 except cssselect.SelectorError as exc:
-                    LOGGER.warn("Invalid or unsupported selector '%s', %s",
-                                selector_string, exc)
+                    LOGGER.warning("Invalid or unsupported selector '%s', %s",
+                                   selector_string, exc)
                     continue
                 yield rule, selector_list, declarations
 
         elif rule.at_keyword == '@import':
-            if not evaluate_media_query(rule.media, medium):
+            if not evaluate_media_query(rule.media, device_media_type):
                 continue
-            for result in CSS(url=urljoin(base_url, rule.uri)).rules:
-                yield result
+            url = url_join(base_url, rule.uri, '@import at %s:%s',
+                           rule.line, rule.column)
+            if url is not None:
+                try:
+                    stylesheet = CSS(url=url, url_fetcher=url_fetcher,
+                                     media_type=device_media_type)
+                except URLFetchingError as exc:
+                    LOGGER.warning('Failed to load stylesheet at %s : %s',
+                                   url, exc)
+                else:
+                    for result in stylesheet.rules:
+                        yield result
 
         elif rule.at_keyword == '@media':
-            if not evaluate_media_query(rule.media, medium):
+            if not evaluate_media_query(rule.media, device_media_type):
                 continue
             for result in preprocess_stylesheet(
-                    medium, base_url, rule.rules):
+                    device_media_type, base_url, rule.rules, url_fetcher):
                 yield result
 
         elif rule.at_keyword == '@page':
             page_name, pseudo_class = rule.selector
             # TODO: support named pages (see CSS3 Paged Media)
             if page_name is not None:
-                LOGGER.warn('Named pages are not supported yet, the whole '
-                            '@page %s rule was ignored.', page_name + (
-                                ':' + pseudo_class if pseudo_class else ''))
+                LOGGER.warning('Named pages are not supported yet, the whole '
+                               '@page %s rule was ignored.', page_name + (
+                                   ':' + pseudo_class if pseudo_class else ''))
                 continue
             declarations = list(preprocess_declarations(
                 base_url, rule.declarations))
 
-            # The double lambda to have a closure that holds page_types
+            # Use a double lambda to have a closure that holds page_types
             match = (lambda page_types: lambda _document: page_types)(
                 PAGE_PSEUDOCLASS_TARGETS[pseudo_class])
             specificity = rule.specificity
@@ -401,17 +430,22 @@ def preprocess_stylesheet(medium, base_url, rules):
                     yield margin_rule, selector_list, declarations
 
 
-def get_all_computed_styles(document, medium,
-                            user_stylesheets=None, ua_stylesheets=None):
-    """Compute all the computed styles of ``document`` for ``medium``.
+def get_all_computed_styles(html, user_stylesheets=None):
+    """Compute all the computed styles of all elements
+    in the given ``html`` document.
 
-    Do everything from finding author stylesheets in the given HTML document
-    to parsing and applying them.
+    Do everything from finding author stylesheets to parsing and applying them.
 
-    Return a dict of (DOM element, pseudo element type) -> StyleDict instance.
+    Return a ``style_for`` function that takes an element and an optional
+    pseudo-element type, and return a StyleDict object.
 
     """
-    author_stylesheets = list(find_stylesheets(document, medium))
+    element_tree = html.root_element
+    device_media_type = html.media_type
+    url_fetcher = html.url_fetcher
+    ua_stylesheets = html._ua_stylesheets()
+    author_stylesheets = list(find_stylesheets(
+        element_tree, device_media_type, url_fetcher))
 
     # keys: (element, pseudo_element_type)
     #    element: a lxml element object or the '@page' string for @page styles
@@ -437,7 +471,7 @@ def get_all_computed_styles(document, medium,
                 for selector in selector_list:
                     specificity = selector.specificity
                     pseudo_type = selector.pseudo_element
-                    for element in selector.match(document.dom):
+                    for element in selector.match(element_tree):
                         for name, values, importance in declarations:
                             precedence = declaration_precedence(
                                 origin, importance)
@@ -447,7 +481,7 @@ def get_all_computed_styles(document, medium,
                                 element, pseudo_type)
 
     specificity = (1, 0, 0, 0)
-    for element, declarations, base_url in find_style_attributes(document):
+    for element, declarations, base_url in find_style_attributes(element_tree):
         for name, values, importance in preprocess_declarations(
                 base_url, declarations):
             precedence = declaration_precedence('author', importance)
@@ -465,20 +499,20 @@ def get_all_computed_styles(document, medium,
     # their children, for inheritance.
 
     # Iterate on all elements, even if there is no cascaded style for them.
-    for element in document.dom.iter():
+    for element in element_tree.iter():
         set_computed_styles(cascaded_styles, computed_styles, element,
                             parent=element.getparent())
-
 
     # Then computed styles for @page.
 
     # Iterate on all possible page types, even if there is no cascaded style
     # for them.
     for page_type in PAGE_PSEUDOCLASS_TARGETS[None]:
-        set_computed_styles(cascaded_styles, computed_styles, page_type,
-        # @page inherits from the root element:
-        # http://lists.w3.org/Archives/Public/www-style/2012Jan/1164.html
-                            parent=document.dom)
+        set_computed_styles(
+            cascaded_styles, computed_styles, page_type,
+            # @page inherits from the root element:
+            # http://lists.w3.org/Archives/Public/www-style/2012Jan/1164.html
+            parent=element_tree)
 
     # Then computed styles for pseudo elements, in any order.
     # Pseudo-elements inherit from their associated element so they come
@@ -495,4 +529,11 @@ def get_all_computed_styles(document, medium,
                                 # The pseudo-element inherits from the element.
                                 parent=element)
 
-    return computed_styles
+    # This is mostly useful to make pseudo_type optional.
+    def style_for(element, pseudo_type=None, __get=computed_styles.get):
+        """
+        Convenience function to get the computed styles for an element.
+        """
+        return __get((element, pseudo_type))
+
+    return style_for

@@ -1,6 +1,349 @@
 WeasyPrint changelog
 ====================
 
+Version 0.23
+------------
+
+Released on 2014-09-16.
+
+Bug fixes:
+
+* `#196: <https://github.com/Kozea/WeasyPrint/issues/196>`_:
+  Use the default image sizing algorithm for images’s preferred size.
+* `#194: <https://github.com/Kozea/WeasyPrint/pull/194>`_:
+  Try more library aliases with ``dlopen()``.
+* `#201: <https://github.com/Kozea/WeasyPrint/pull/201>`_:
+  Consider ``page-break-after-avoid`` when pushing floats to the next page.
+* `#217: <https://github.com/Kozea/WeasyPrint/issues/217>`_:
+  Avoid a crash on zero-sized background images.
+
+Release process:
+
+* Start testing on Python 3.4 on Travis-CI.
+
+
+Version 0.22
+------------
+
+Released on 2014-05-05.
+
+New features:
+
+* `#86 <https://github.com/Kozea/WeasyPrint/pull/86>`_:
+  Support gzip and deflate encoding in HTTP responses
+* `#177 <https://github.com/Kozea/WeasyPrint/pull/177>`_:
+  Support for PDF attachments.
+
+Bug fixes:
+
+* `#169 <https://github.com/Kozea/WeasyPrint/issues/169>`_:
+  Fix a crash on percentage-width columns in an auto-width table.
+* `#168 <https://github.com/Kozea/WeasyPrint/issues/168>`_:
+  Make ``<fieldset>`` a block in the user-agent stylesheet.
+* `#175 <https://github.com/Kozea/WeasyPrint/issues/175>`_:
+  Fix some ``dlopen()`` library loading issues on OS X.
+* `#183 <https://github.com/Kozea/WeasyPrint/issues/183>`_:
+  Break to the next page before a float that would overflow the page.
+  (It might still overflow if it’s bigger than the page.)
+* `#188 <https://github.com/Kozea/WeasyPrint/issues/188>`_:
+  Require a recent enough version of Pyphen
+
+
+Release process:
+
+* Drop Python 3.1 support.
+* Set up [Travis CI](http://travis-ci.org/)
+  to automatically test all pushes and pull requests.
+* Start testing on Python 3.4 locally. (Travis does not support 3.4 yet.)
+
+
+Version 0.21
+------------
+
+Released on 2014-01-11.
+
+
+New features:
+
+* Add the `overflow-wrap <http://dev.w3.org/csswg/css-text/#overflow-wrap>`_
+  property, allowing line breaks inside otherwise-unbreakable words.
+  Thanks Frédérick Deslandes!
+* Add the `image-resolution
+  <http://dev.w3.org/csswg/css-images-3/#the-image-resolution>`_ property,
+  allowing images to be sized proportionally to their intrinsic size
+  at a resolution other than 96 image pixels per CSS ``in``
+  (ie. one image pixel per CSS ``px``)
+
+
+Bug fixes:
+
+* `#145 <https://github.com/Kozea/WeasyPrint/issues/145>`_:
+  Fix parsing HTML from an HTTP URL on Python 3.x
+* `#40 <https://github.com/Kozea/WeasyPrint/issues/40>`_:
+  Use more general hyphenation dictionnaries for specific document languages.
+  (E.g. use ``hyph_fr.dic`` for ``lang="fr_FR"``.)
+* `#26 <https://github.com/Kozea/WeasyPrint/issues/26>`_:
+  Fix ``min-width`` and ``max-width`` on floats.
+* `#100 <https://github.com/Kozea/WeasyPrint/issues/100>`_:
+  Fix a crash on trailing whitespace with ``font-size: 0``
+* `#82 <https://github.com/Kozea/WeasyPrint/issues/82>`_:
+  Borders on tables with ``border-collapse: collapse`` were sometimes
+  drawn at an incorrect position.
+* `#30 <https://github.com/Kozea/WeasyPrint/issues/30>`_:
+  Fix positioning of images with ``position: absolute``.
+* `#118 <https://github.com/Kozea/WeasyPrint/issues/118>`_:
+  Fix a crash when using ``position: absolute``
+  inside a ``position: relative`` element.
+* Fix ``visibility: collapse`` to behave like ``visibility: hidden``
+  on elements other than table rows and table columns.
+* `#147 <https://github.com/Kozea/WeasyPrint/issues/147>`_ and
+  `#153 <https://github.com/Kozea/WeasyPrint/issues/153>`_:
+  Fix dependencies to require lxml 3.0 or a more recent version.
+  Thanks gizmonerd and Thomas Grainger!
+* `#152 <https://github.com/Kozea/WeasyPrint/issues/152>`_:
+  Fix a crash on percentage-sized table cells in auto-sized tables.
+  Thanks Johannes Duschl!
+
+
+Version 0.20.2
+--------------
+
+Released on 2013-12-18.
+
+* Fix `#146 <https://github.com/Kozea/WeasyPrint/issues/146>`_: don't crash
+  when drawing really small boxes with dotted/dashed borders
+
+
+Version 0.20.1
+--------------
+
+Released on 2013-12-16.
+
+* Depend on html5lib >= 0.99 instead of 1.0b3 to fix pip 1.4 support.
+* Fix `#74 <https://github.com/Kozea/WeasyPrint/issues/74>`_: don't crash on
+  space followed by dot at line break.
+* Fix `#78 <https://github.com/Kozea/WeasyPrint/issues/78>`_: nicer colors for
+  border-style: ridge/groove/inset/outset.
+
+
+Version 0.20
+------------
+
+Released on 2013-12-14.
+
+* Add support for ``border-radius``.
+* Feature `#77 <https://github.com/Kozea/WeasyPrint/issues/77>`_: Add PDF
+  metadata from HTML.
+* Feature `#12 <https://github.com/Kozea/WeasyPrint/pull/12>`_: Use html5lib.
+* Tables: handle percentages for column groups, columns and cells, and values
+  for row height.
+* Bug fixes:
+
+  * Fix `#84 <https://github.com/Kozea/WeasyPrint/pull/84>`_: don't crash when
+    stylesheets are not available.
+  * Fix `#101 <https://github.com/Kozea/WeasyPrint/issues/101>`_: use page ids
+    instead of page numbers in PDF bookmarks.
+  * Use ``logger.warning`` instead of deprecated ``logger.warn``.
+  * Add 'font-stretch' in the 'font' shorthand.
+
+
+Version 0.19.2
+--------------
+
+Released on 2013-06-18.
+
+Bug fix release:
+
+* Fix `#88 <https://github.com/Kozea/WeasyPrint/issues/88>`_:
+  ``text-decoration: overline`` not being drawn above the text
+* Bug fix: Actually draw multiple lines when multiple values are given
+  to ``text-decoration``.
+* Use the font metrics for text decoration positioning.
+* Bug fix: Don't clip the border with ``overflow: hidden``.
+* Fix `#99 <https://github.com/Kozea/WeasyPrint/issues/99>`_:
+  Regression: JPEG images not loading with cairo 1.8.x.
+
+
+Version 0.19.1
+--------------
+
+Released on 2013-04-30.
+
+Bug fix release:
+
+* Fix incorrect intrinsic width calculation
+  leading to unnecessary line breaks in floats, tables, etc.
+* Tweak border painting to look better
+* Fix unnecessary page break before big tables.
+* Fix table row overflowing at the bottom of the page
+  when there are margins above the table.
+* Fix ``position: fixed`` to actually repeat on every page.
+* Fix `#76 <https://github.com/Kozea/WeasyPrint/issues/76>`_:
+  repeat ``<thead>`` and ``<tfoot>`` elements on every page,
+  even with table border collapsing.
+
+
+Version 0.19
+------------
+
+Released on 2013-04-18.
+
+* Add support for ``linear-gradient()`` and ``radial-gradient``
+  in background images.
+* Add support for the ``ex`` and ``ch`` length units.
+  (``1ex`` is based on the font instead of being always ``0.5em`` as before.)
+* Add experimental support for Level 4 hyphenation properties.
+* Drop support for CFFI < 0.6 and cairocffi < 0.4.
+* Many bug fixes, including:
+
+ * Fix `#54 <https://github.com/Kozea/WeasyPrint/issues/54>`_:
+   min/max-width/height on block-level images.
+ * Fix `#71 <https://github.com/Kozea/WeasyPrint/issues/71>`_:
+   Crash when parsing nested functional notation.
+
+
+Version 0.18
+------------
+
+Released on 2013-03-30.
+
+* Add support for Level 3 backgrounds,
+  including multiple background layers per element/box.
+* Forward-compatibility with (future releases of) cairocffi 0.4+ and CFFI 0.6+.
+* Bug fixes:
+
+  * Avoid some unnecessary line breaks
+    for elements sized based on their content (aka. “shrink-to-fit”)
+    such as floats and page headers.
+  * Allow page breaks between empty blocks.
+  * Fix `#66 <https://github.com/Kozea/WeasyPrint/issues/66>`_:
+    Resolve images’ auto width from non-auto height and intrinsic ratio.
+  * Fix `#21 <https://github.com/Kozea/WeasyPrint/issues/21>`_:
+    The ``data:`` URL scheme is case-insensitive.
+  * Fix `#53 <https://github.com/Kozea/WeasyPrint/issues/53>`_:
+    Crash when backtracking for ``break-before/after: avoid``.
+
+
+Version 0.17.1
+--------------
+
+Released on 2013-03-18.
+
+Bug fixes:
+
+* Fix `#41 <https://github.com/Kozea/WeasyPrint/issues/41>`_:
+  GObject initialization when GDK-PixBuf is not installed.
+* Fix `#42 <https://github.com/Kozea/WeasyPrint/issues/42>`_:
+  absolute URLs without a base URL (ie. document parsed from a string.)
+* Fix some whitespace collapsing bugs.
+* Fix absolutely-positioned elements inside inline elements.
+* Fix URL escaping of image references from CSS.
+* Fix `#49 <https://github.com/Kozea/WeasyPrint/issues/49>`_:
+  Division by 0 on dashed or dotted border smaller than one dot/dash.
+* Fix `#44 <https://github.com/Kozea/WeasyPrint/issues/44>`_:
+  bad interaction of ``page-break-before/after: avoid`` and floats.
+
+
+Version 0.17
+------------
+
+Released on 2013-02-27.
+
+* Added `text hyphenation`_ with the ``-weasy-hyphens`` property.
+* When a document includes JPEG images, embed them as JPEG in the PDF output.
+  This often results in smaller PDF file size
+  compared to the default *deflate* compression.
+* Switched to using CFFI instead of PyGTK or PyGObject-introspection.
+* Layout bug fixes:
+
+  - Correctly trim whitespace at the end of lines.
+  - Fix some cases with floats within inline content.
+
+.. _text hyphenation: http://weasyprint.org/docs/features/#hyphenation
+
+
+Version 0.16
+------------
+
+Released on 2012-12-13.
+
+* Add the :obj:`zoom` parameter to :meth:`HTML.write_pdf` and
+  :meth:`Document.write_pdf() <weasyprint.document.Document.write_pdf>`
+* Fix compatibility with old (and buggy) pycairo versions.
+  WeasyPrint is now tested on 1.8.8 in addition to the latest.
+* Fix layout bugs related to line trailing spaces.
+
+
+Version 0.15
+------------
+
+Released on 2012-10-09.
+
+* Add a low-level API that enables painting pages individually on any
+  cairo surface.
+* **Backward-incompatible change**: remove the :meth:`HTML.get_png_pages`
+  method. The new low-level API covers this functionality and more.
+* Add support for the ``font-stretch`` property.
+* Add support for ``@page:blank`` to select blank pages.
+* New Sphinx-based and improved docs
+* Bug fixes:
+
+  - Importing Pango in some PyGTK installations.
+  - Layout of inline-blocks with `vertical-align: top` or `bottom`.
+  - Do not repeat a block’s margin-top or padding-top after a page break.
+  - Performance problem with large tables split across many pages.
+  - Anchors and hyperlinks areas now follow CSS transforms.
+    Since PDF links have to be axis-aligned rectangles, the bounding box
+    is used. This may be larger than expected with rotations that are
+    not a multiple of 90 degrees.
+
+
+Version 0.14
+------------
+
+Released on 2012-08-03.
+
+* Add a public API to choose media type used for @media.
+  (It still defaults to ``print``). Thanks Chung Lu!
+* Add ``--base-url`` and ``--resolution`` to the command-line API, making it
+  as complete as the Python one.
+* Add support for the ``<base href="...">`` element in HTML.
+* Add support for CSS outlines
+* Switch to gdk-pixbuf instead of Pystacia for loading raster images.
+* Bug fixes:
+
+  - Handling of filenames and URLs on Windows
+  - Unicode filenames with older version of py2cairo
+  - ``base_url`` now behaves as expected when set to a directory name.
+  - Make some tests more robust
+
+
+Version 0.13
+------------
+
+Released on 2012-07-23.
+
+* Add support for PyGTK, as an alternative to PyGObject + introspection.
+  This should make WeasyPrint easier to run on platforms that not not have
+  packages for PyGObject 3.x yet.
+* Bug fix: crash in PDF outlines for some malformed HTML documents
+
+
+Version 0.12
+------------
+
+Released on 2012-07-19.
+
+* Add support for collapsed borders on tables. This is currently incompatible
+  with repeating header and footer row groups on each page: headers and footers
+  are treated as normal row groups on table with ``border-collapse: collapse``.
+* Add ``url_fetcher`` to the public API. This enables users to hook into
+  WeasyPrint for fetching linked stylesheets or images, eg. to generate them
+  on the fly without going through the network.
+  This enables the creation of `Flask-WeasyPrint
+  <http://packages.python.org/Flask-WeasyPrint/>`_.
+
+
 Version 0.11
 ------------
 
@@ -12,8 +355,8 @@ Released on 2012-07-04.
 * Add support for the width, min-width, max-width, height, min-height and
   max-height properties in @page. The size property is now the size of the
   page’s containing block.
-* Switch the Variable Dimension rules to the new proposal:
-  https://github.com/SimonSapin/css/blob/master/margin-boxes-variable-dimension
+* Switch the Variable Dimension rules to `the new proposal
+  <https://github.com/SimonSapin/css/blob/master/margin-boxes-variable-dimension>`_.
   The previous implementation was broken in many cases.
 * The ``image-rendering``, ``transform``, ``transform-origin`` and ``size``
   properties are now unprefixed. The prefixed form (eg. -weasy-size) is ignored
@@ -152,7 +495,7 @@ Released on 2012-02-07.
 
 
 Version 0.3.1
------------
+-------------
 
 Released on 2011-12-14.
 

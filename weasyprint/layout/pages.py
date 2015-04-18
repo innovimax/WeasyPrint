@@ -5,14 +5,13 @@
 
     Layout for pages and CSS3 margin boxes.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
 
-from ..logger import LOGGER
 from ..formatting_structure import boxes, build
 from .absolute import absolute_layout
 from .blocks import block_level_layout, block_container_layout
@@ -44,10 +43,9 @@ class OrientedBox(object):
         self.inner = min(max(self.minimum, available), self.preferred)
 
 
-
 class VerticalBox(OrientedBox):
-    def __init__(self, document, box):
-        self.document = document
+    def __init__(self, context, box):
+        self.context = context
         self.box = box
         # Inner dimension: that of the content area, as opposed to the
         # outer dimension: that of the margin area.
@@ -75,8 +73,8 @@ class VerticalBox(OrientedBox):
 
 
 class HorizontalBox(OrientedBox):
-    def __init__(self, document, box):
-        self.document = document
+    def __init__(self, context, box):
+        self.context = context
         self.box = box
         self.inner = box.width
         self.margin_a = box.margin_left
@@ -97,18 +95,18 @@ class HorizontalBox(OrientedBox):
     def minimum(self):
         if self._minimum is None:
             self._minimum = preferred_minimum_width(
-                self.document, self.box, outer=False)
+                self.context, self.box, outer=False)
         return self._minimum
 
     @property
     def preferred(self):
         if self._preferred is None:
             self._preferred = preferred_width(
-                self.document, self.box, outer=False)
+                self.context, self.box, outer=False)
         return self._preferred
 
 
-def compute_fixed_dimension(document, box, outer, vertical, top_or_left):
+def compute_fixed_dimension(context, box, outer, vertical, top_or_left):
     """
     Compute and set a margin box fixed dimension on ``box``, as described in:
     http://dev.w3.org/csswg/css3-page/#margin-constraints
@@ -126,7 +124,7 @@ def compute_fixed_dimension(document, box, outer, vertical, top_or_left):
         This determines which margin should be 'auto' if the values are
         over-constrained. (Rule 3 of the algorithm.)
     """
-    box = (VerticalBox if vertical else HorizontalBox)(document, box)
+    box = (VerticalBox if vertical else HorizontalBox)(context, box)
 
     # Rule 2
     total = box.padding_plus_border + sum(
@@ -182,7 +180,7 @@ def compute_fixed_dimension(document, box, outer, vertical, top_or_left):
     box.restore_box_attributes()
 
 
-def compute_variable_dimension(document, side_boxes, vertical, outer_sum):
+def compute_variable_dimension(context, side_boxes, vertical, outer_sum):
     """
     Compute and set a margin box fixed dimension on ``box``, as described in:
     http://dev.w3.org/csswg/css3-page/#margin-dimension
@@ -200,7 +198,7 @@ def compute_variable_dimension(document, side_boxes, vertical, outer_sum):
 
     """
     box_class = VerticalBox if vertical else HorizontalBox
-    side_boxes = [box_class(document, box) for box in side_boxes]
+    side_boxes = [box_class(context, box) for box in side_boxes]
     box_a, box_b, box_c = side_boxes
 
     for box in side_boxes:
@@ -212,7 +210,7 @@ def compute_variable_dimension(document, side_boxes, vertical, outer_sum):
     if box_b.box.is_generated:
         if box_b.inner == 'auto':
             ac_preferred = 2 * max(
-                    box_a.outer_preferred, box_c.outer_preferred)
+                box_a.outer_preferred, box_c.outer_preferred)
             if outer_sum >= box_b.outer_preferred + ac_preferred:
                 box_b.inner = box_b.preferred
             else:
@@ -271,13 +269,8 @@ def compute_variable_dimension(document, side_boxes, vertical, outer_sum):
         box.restore_box_attributes()
 
 
-def make_margin_boxes(document, page, counter_values):
-    """Yield laid-out margin boxes for this page.
-
-    :param document: a :class:`Document` object
-    :param page: a :class:`PageBox` object
-
-    """
+def make_margin_boxes(context, page, counter_values):
+    """Yield laid-out margin boxes for this page."""
     # This is a closure only to make calls shorter
     def make_box(at_keyword, containing_block):
         """
@@ -290,7 +283,7 @@ def make_margin_boxes(document, page, counter_values):
         :param containing_block: as expected by :func:`resolve_percentages`.
 
         """
-        style = document.style_for(page.page_type, at_keyword)
+        style = context.style_for(page.page_type, at_keyword)
         if style is None:
             style = page.style.inherit_from()
         box = boxes.MarginBox(at_keyword, style)
@@ -301,7 +294,8 @@ def make_margin_boxes(document, page, counter_values):
         if box.is_generated:
             quote_depth = [0]
             children = build.content_to_boxes(
-                document, box.style, box, quote_depth, counter_values)
+                box.style, box, quote_depth, counter_values,
+                context.get_image_from_uri)
             box = box.copy_with_children(children)
             # content_to_boxes() only produces inline-level boxes, no need to
             # run other post-processors from build.build_formatting_structure()
@@ -351,7 +345,7 @@ def make_margin_boxes(document, page, counter_values):
             continue
         # We need the three boxes together for the variable dimension:
         compute_variable_dimension(
-            document, side_boxes, vertical, variable_outer)
+            context, side_boxes, vertical, variable_outer)
         for box, offset in zip(side_boxes, [0, 0.5, 1]):
             if not box.is_generated:
                 continue
@@ -364,7 +358,7 @@ def make_margin_boxes(document, page, counter_values):
                 box.position_x += offset * (
                     variable_outer - box.margin_width())
             compute_fixed_dimension(
-                document, box, fixed_outer, not vertical,
+                context, box, fixed_outer, not vertical,
                 prefix in ['top', 'left'])
             generated_boxes.append(box)
 
@@ -383,19 +377,19 @@ def make_margin_boxes(document, page, counter_values):
         box.position_x = position_x
         box.position_y = position_y
         compute_fixed_dimension(
-            document, box, cb_height, True, 'top' in at_keyword)
+            context, box, cb_height, True, 'top' in at_keyword)
         compute_fixed_dimension(
-            document, box, cb_width, False, 'left' in at_keyword)
+            context, box, cb_width, False, 'left' in at_keyword)
         generated_boxes.append(box)
 
     for box in generated_boxes:
-        yield margin_box_content_layout(document, page, box)
+        yield margin_box_content_layout(context, page, box)
 
 
-def margin_box_content_layout(document, page, box):
+def margin_box_content_layout(context, page, box):
     """Layout a margin box’s content once the box has dimensions."""
     box, resume_at, next_page, _, _ = block_container_layout(
-        document, box,
+        context, box,
         max_position_y=float('inf'), skip_stack=None,
         device_size=page.style.size, page_is_empty=True,
         absolute_boxes=[], fixed_boxes=[])
@@ -408,7 +402,7 @@ def margin_box_content_layout(document, page, box):
         last_child = box.children[-1]
         top = first_child.position_y
         # Not always exact because floating point errors
-        #assert top == box.content_box_y()
+        # assert top == box.content_box_y()
         bottom = last_child.position_y + last_child.margin_height()
         content_height = bottom - top
         offset = box.height - content_height
@@ -451,29 +445,28 @@ def page_width_or_height(box, containing_block_size):
 
 
 @handle_min_max_width
-def page_width(box, document, containing_block_width):
-    page_width_or_height(HorizontalBox(document, box), containing_block_width)
+def page_width(box, context, containing_block_width):
+    page_width_or_height(HorizontalBox(context, box), containing_block_width)
 
 
 @handle_min_max_height
-def page_height(box, document, containing_block_height):
-    page_width_or_height(VerticalBox(document, box), containing_block_height)
+def page_height(box, context, containing_block_height):
+    page_width_or_height(VerticalBox(context, box), containing_block_height)
 
 
-def make_page(document, root_box, page_type, resume_at, content_empty):
+def make_page(context, root_box, page_type, resume_at, content_empty):
     """Take just enough content from the beginning to fill one page.
 
     Return ``(page, finished)``. ``page`` is a laid out PageBox object
     and ``resume_at`` indicates where in the document to start the next page,
     or is ``None`` if this was the last page.
 
-    :param document: a Document object
     :param page_number: integer, start at 1 for the first page
     :param resume_at: as returned by ``make_page()`` for the previous page,
                       or ``None`` for the first page.
 
     """
-    style = document.style_for(page_type)
+    style = context.style_for(page_type)
     # Propagated from the root or <body>.
     style.overflow = root_box.viewport_overflow
     page = boxes.PageBox(page_type, style)
@@ -485,10 +478,8 @@ def make_page(document, root_box, page_type, resume_at, content_empty):
     page.position_x = 0
     page.position_y = 0
     cb_width, cb_height = device_size
-    page_width(page, document, cb_width)
-    page_height(page, document, cb_height)
-
-    document.excluded_shapes = []
+    page_width(page, context, cb_width)
+    page_height(page, context, cb_height)
 
     root_box.position_x = page.content_box_x()
     root_box.position_y = page.content_box_y()
@@ -502,17 +493,22 @@ def make_page(document, root_box, page_type, resume_at, content_empty):
     # TODO: handle cases where the root element is something else.
     # See http://www.w3.org/TR/CSS21/visuren.html#dis-pos-flo
     assert isinstance(root_box, boxes.BlockBox)
+    context.create_block_formatting_context()
     page_is_empty = True
     adjoining_margins = []
     positioned_boxes = []  # Mixed absolute and fixed
     root_box, resume_at, next_page, _, _ = block_level_layout(
-        document, root_box, page_content_bottom, resume_at,
+        context, root_box, page_content_bottom, resume_at,
         initial_containing_block, device_size, page_is_empty,
         positioned_boxes, positioned_boxes, adjoining_margins)
     assert root_box
 
+    page.fixed_boxes = [
+        placeholder._box for placeholder in positioned_boxes
+        if placeholder._box.style.position == 'fixed']
     for absolute_box in positioned_boxes:
-        absolute_layout(document, absolute_box, page, positioned_boxes)
+        absolute_layout(context, absolute_box, page, positioned_boxes)
+    context.finish_block_formatting_context(root_box)
 
     page = page.copy_with_children([root_box])
     if content_empty:
@@ -520,7 +516,7 @@ def make_page(document, root_box, page_type, resume_at, content_empty):
     return page, resume_at, next_page
 
 
-def make_all_pages(document, root_box):
+def make_all_pages(context, root_box):
     """Return a list of laid out pages without margin boxes."""
     prefix = 'first_'
 
@@ -536,11 +532,13 @@ def make_all_pages(document, root_box):
     resume_at = None
     next_page = 'any'
     while True:
-        page_type = prefix + ('right_page' if right_page else 'left_page')
         content_empty = ((next_page == 'left' and right_page) or
                          (next_page == 'right' and not right_page))
+        if content_empty:
+            prefix += 'blank_'
+        page_type = prefix + ('right_page' if right_page else 'left_page')
         page, resume_at, next_page = make_page(
-            document, root_box, page_type, resume_at, content_empty)
+            context, root_box, page_type, resume_at, content_empty)
         assert next_page
         yield page
         if resume_at is None:

@@ -5,15 +5,21 @@
 
     Test that the "before layout" box tree is correctly constructed.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
 
+import functools
+import pprint
+import difflib
+
 from .testing_utils import (
-    resource_filename, TestPNGDocument, assert_no_logs, capture_logs)
+    resource_filename, TestHTML, assert_no_logs, capture_logs)
+from ..css import get_all_computed_styles
+from .. import images
 from ..formatting_structure import boxes, build, counters
 
 
@@ -37,20 +43,15 @@ PROPER_CHILDREN = dict((key, tuple(map(tuple, value))) for key, value in {
 def serialize(box_list):
     """Transform a box list into a structure easier to compare for testing."""
     return [
-        (
-            box.element_tag,
-            ('Anon'
-                 if box.style.anonymous and
-                       type(box) not in (boxes.TextBox, boxes.LineBox)
-                 else ''
-             ) + type(box).__name__[:-3],
-            (
-            # All concrete boxes are either text, replaced, column or parent.
-            box.text if isinstance(box, boxes.TextBox)
-            else '<replaced>' if isinstance(box, boxes.ReplacedBox)
-            else serialize(getattr(box, 'column_groups', ()) + box.children)))
-        for box in box_list
-    ]
+        (box.element_tag,
+         ('Anon' if (box.style.anonymous and
+                     type(box) not in (boxes.TextBox, boxes.LineBox))
+          else '') + type(box).__name__[:-3],
+         # All concrete boxes are either text, replaced, column or parent.
+         (box.text if isinstance(box, boxes.TextBox)
+          else '<replaced>' if isinstance(box, boxes.ReplacedBox)
+          else serialize(getattr(box, 'column_groups', ()) + box.children)))
+        for box in box_list]
 
 
 def unwrap_html_body(box):
@@ -76,21 +77,36 @@ def to_lists(box_tree):
     return serialize(unwrap_html_body(box_tree))
 
 
+def _parse_base(
+        html_content,
+        # Dummy filename, but in the right directory.
+        base_url=resource_filename('<test>')):
+    document = TestHTML(string=html_content, base_url=base_url)
+    style_for = get_all_computed_styles(document)
+    get_image_from_uri = functools.partial(
+        images.get_image_from_uri, {}, document.url_fetcher)
+    return document.root_element, style_for, get_image_from_uri
+
+
 def parse(html_content):
     """Parse some HTML, apply stylesheets and transform to boxes."""
-    document = TestPNGDocument(html_content,
-        # Dummy filename, but in the right directory.
-        base_url=resource_filename('<test>'))
-    box, = build.dom_to_box(document, document.dom)
+    box, = build.element_to_box(*_parse_base(html_content))
     return box
 
 
 def parse_all(html_content, base_url=resource_filename('<test>')):
     """Like parse() but also run all corrections on boxes."""
-    document = TestPNGDocument(html_content, base_url=base_url)
-    box = build.build_formatting_structure(document, document.computed_styles)
+    box = build.build_formatting_structure(*_parse_base(
+        html_content, base_url))
     sanity_checks(box)
     return box
+
+
+def render_pages(html_content):
+    """Lay out a document and return a list of PageBox objects."""
+    return [p._page_box for p in TestHTML(
+            string=html_content, base_url=resource_filename('<test>')
+            ).render(enable_hinting=True).pages]
 
 
 def assert_tree(box, expected):
@@ -102,7 +118,12 @@ def assert_tree(box, expected):
     expected: a list of serialized <body> children as returned by to_lists().
 
     """
-    assert to_lists(box) == expected
+    lists = to_lists(box)
+    if lists != expected:
+        print(''.join(difflib.unified_diff(
+            *[pprint.pformat(v).splitlines(True) for v in [lists, expected]],
+            n=9999)))
+        assert lists == expected
 
 
 def sanity_checks(box):
@@ -126,7 +147,7 @@ def sanity_checks(box):
 
     assert any(
         all(isinstance(child, acceptable_types)
-                or not child.is_in_normal_flow()
+            or not child.is_in_normal_flow()
             for child in box.children)
         for acceptable_types in acceptable_types_lists
     ), (box, box.children)
@@ -139,19 +160,19 @@ def sanity_checks(box):
 def test_box_tree():
     """Test the creation of trees from HTML strings."""
     assert_tree(parse('<p>'), [('p', 'Block', [])])
-    assert_tree(parse('''
+    assert_tree(parse(
+        '''
         <style>
             span { display: inline-block }
         </style>
-        <p>Hello <em>World <img src="pattern.png"><span>Lipsum</span></em>!</p>
-    '''), [
-        ('p', 'Block', [
+        <p>Hello <em>World <img src="pattern.png"><span>L</span></em>!</p>'''),
+        [('p', 'Block', [
             ('p', 'Text', 'Hello '),
             ('em', 'Inline', [
                 ('em', 'Text', 'World '),
                 ('img', 'InlineReplaced', '<replaced>'),
                 ('span', 'InlineBlock', [
-                    ('span', 'Text', 'Lipsum')])]),
+                    ('span', 'Text', 'L')])]),
             ('p', 'Text', '!')])])
 
 
@@ -237,11 +258,10 @@ def test_block_in_inline():
     box = parse('''
 <style>
     p { display: inline-block; }
-    span { display: block; }
+    span, i { display: block; }
 </style>
 <p>Lorem <em>ipsum <strong>dolor <span>sit</span>
-    <span>amet,</span></strong><span><em>consectetur<div/></em></span></em></p>
-    ''')
+    <span>amet,</span></strong><span><em>conse<i></i></em></span></em></p>''')
     box = build.inline_in_block(box)
     assert_tree(box, [
         ('body', 'Line', [
@@ -263,9 +283,8 @@ def test_block_in_inline():
                         ('span', 'Block', [  # This block is "pulled up"
                             ('span', 'Line', [
                                 ('em', 'Inline', [
-                                    ('em', 'Text', 'consectetur'),
-                                    ('div', 'Block', []),
-                                    ])])])])])])])])
+                                    ('em', 'Text', 'conse'),
+                                    ('i', 'Block', [])])])])])])])])])
 
     box = build.block_in_inline(box)
     assert_tree(box, [
@@ -299,8 +318,8 @@ def test_block_in_inline():
                     ('span', 'AnonBlock', [
                         ('span', 'Line', [
                             ('em', 'Inline', [
-                                ('em', 'Text', 'consectetur')])])]),
-                    ('div', 'Block', []),
+                                ('em', 'Text', 'conse')])])]),
+                    ('i', 'Block', []),
                     ('span', 'AnonBlock', [
                         ('span', 'Line', [
                             ('em', 'Inline', [])])])]),
@@ -380,18 +399,18 @@ def test_whitespace():
 @assert_no_logs
 def test_page_style():
     """Test the management of page styles."""
-    document = TestPNGDocument('''
+    style_for = get_all_computed_styles(TestHTML(string='''
         <style>
             @page { margin: 3px }
             @page :first { margin-top: 20px }
             @page :right { margin-right: 10px; margin-top: 10px }
             @page :left { margin-left: 10px; margin-top: 10px }
         </style>
-    ''')
+    '''))
 
     def assert_page_margins(page_type, top, right, bottom, left):
         """Check the page margin values."""
-        style = document.style_for(page_type)
+        style = style_for(page_type)
         assert style.margin_top == (top, 'px')
         assert style.margin_right == (right, 'px')
         assert style.margin_bottom == (bottom, 'px')
@@ -437,10 +456,10 @@ def test_images():
         result = parse_all('''
             <p><img src=pattern.png
                 /><img alt="No src"
-                /><img src=inexistent.jpg alt="Inexistent src" />
+                /><img src=inexistent.jpg alt="Inexistent src" /></p>
         ''')
     assert len(logs) == 1
-    assert 'WARNING: Error for image' in logs[0]
+    assert 'WARNING: Failed to load image' in logs[0]
     assert 'inexistent.jpg' in logs[0]
     assert_tree(result, [
         ('p', 'Block', [
@@ -449,8 +468,7 @@ def test_images():
                 ('img', 'Inline', [
                     ('img', 'Text', 'No src')]),
                 ('img', 'Inline', [
-                    ('img', 'Text', 'Inexistent src')]),
-            ])])])
+                    ('img', 'Text', 'Inexistent src')])])])])
 
     with capture_logs() as logs:
         result = parse_all('<p><img src=pattern.png alt="No base_url">',
@@ -470,48 +488,48 @@ def test_tables():
     # Rule 1.3
     # Also table model: http://www.w3.org/TR/CSS21/tables.html#model
     assert_tree(parse_all('''
-        <table>
-            <tr>
-                <th>foo</th>
-                <th>bar</th>
-            </tr>
-            <tfoot></tfoot>
-            <thead><th></th></thead>
-            <caption style="caption-side: bottom"></caption>
-            <thead></thead>
-            <col></col>
-            <caption>top caption</caption>
-            <tr>
-                <td>baz</td>
-            </tr>
-        </table>
+        <x-table>
+            <x-tr>
+                <x-th>foo</x-th>
+                <x-th>bar</x-th>
+            </x-tr>
+            <x-tfoot></x-tfoot>
+            <x-thead><x-th></x-th></x-thead>
+            <x-caption style="caption-side: bottom"></x-caption>
+            <x-thead></x-thead>
+            <x-col></x-col>
+            <x-caption>top caption</x-caption>
+            <x-tr>
+                <x-td>baz</x-td>
+            </x-tr>
+        </x-table>
     '''), [
-        ('table', 'AnonBlock', [
-            ('caption', 'TableCaption', [
-                ('caption', 'Line', [
-                    ('caption', 'Text', 'top caption')])]),
-            ('table', 'Table', [
-                ('table', 'AnonTableColumnGroup', [
-                    ('col', 'TableColumn', [])]),
-                ('thead', 'TableRowGroup', [
-                    ('thead', 'AnonTableRow', [
-                        ('th', 'TableCell', [])])]),
-                ('table', 'AnonTableRowGroup', [
-                    ('tr', 'TableRow', [
-                        ('th', 'TableCell', [
-                            ('th', 'Line', [
-                                ('th', 'Text', 'foo')])]),
-                        ('th', 'TableCell', [
-                            ('th', 'Line', [
-                                ('th', 'Text', 'bar')])])])]),
-                ('thead', 'TableRowGroup', []),
-                ('table', 'AnonTableRowGroup', [
-                    ('tr', 'TableRow', [
-                        ('td', 'TableCell', [
-                            ('td', 'Line', [
-                                ('td', 'Text', 'baz')])])])]),
-                ('tfoot', 'TableRowGroup', [])]),
-            ('caption', 'TableCaption', [])])])
+        ('x-table', 'AnonBlock', [
+            ('x-caption', 'TableCaption', [
+                ('x-caption', 'Line', [
+                    ('x-caption', 'Text', 'top caption')])]),
+            ('x-table', 'Table', [
+                ('x-table', 'AnonTableColumnGroup', [
+                    ('x-col', 'TableColumn', [])]),
+                ('x-thead', 'TableRowGroup', [
+                    ('x-thead', 'AnonTableRow', [
+                        ('x-th', 'TableCell', [])])]),
+                ('x-table', 'AnonTableRowGroup', [
+                    ('x-tr', 'TableRow', [
+                        ('x-th', 'TableCell', [
+                            ('x-th', 'Line', [
+                                ('x-th', 'Text', 'foo')])]),
+                        ('x-th', 'TableCell', [
+                            ('x-th', 'Line', [
+                                ('x-th', 'Text', 'bar')])])])]),
+                ('x-thead', 'TableRowGroup', []),
+                ('x-table', 'AnonTableRowGroup', [
+                    ('x-tr', 'TableRow', [
+                        ('x-td', 'TableCell', [
+                            ('x-td', 'Line', [
+                                ('x-td', 'Text', 'baz')])])])]),
+                ('x-tfoot', 'TableRowGroup', [])]),
+            ('x-caption', 'TableCaption', [])])])
 
     # Rules 1.4 and 3.1
     assert_tree(parse_all('''
@@ -551,72 +569,74 @@ def test_tables():
                     ('ins', 'AnonTableColumn', [])])])])])
 
     # Rules 2.1 then 2.3
-    assert_tree(parse_all('<table>foo <div></div></table>'), [
-        ('table', 'AnonBlock', [
-            ('table', 'Table', [
-                ('table', 'AnonTableRowGroup', [
-                    ('table', 'AnonTableRow', [
-                        ('table', 'AnonTableCell', [
-                            ('table', 'AnonBlock', [
-                                ('table', 'Line', [
-                                    ('table', 'Text', 'foo ')])]),
+    assert_tree(parse_all('<x-table>foo <div></div></x-table>'), [
+        ('x-table', 'AnonBlock', [
+            ('x-table', 'Table', [
+                ('x-table', 'AnonTableRowGroup', [
+                    ('x-table', 'AnonTableRow', [
+                        ('x-table', 'AnonTableCell', [
+                            ('x-table', 'AnonBlock', [
+                                ('x-table', 'Line', [
+                                    ('x-table', 'Text', 'foo ')])]),
                             ('div', 'Block', [])])])])])])])
 
     # Rule 2.2
-    assert_tree(parse_all('<thead><div></div><td></td></thead>'), [
+    assert_tree(parse_all('<x-thead style="display: table-header-group">'
+                          '<div></div><x-td></x-td></x-thead>'), [
         ('body', 'AnonBlock', [
             ('body', 'AnonTable', [
-                ('thead', 'TableRowGroup', [
-                    ('thead', 'AnonTableRow', [
-                        ('thead', 'AnonTableCell', [
+                ('x-thead', 'TableRowGroup', [
+                    ('x-thead', 'AnonTableRow', [
+                        ('x-thead', 'AnonTableCell', [
                             ('div', 'Block', [])]),
-                        ('td', 'TableCell', [])])])])])])
+                        ('x-td', 'TableCell', [])])])])])])
 
     # TODO: re-enable this once we support inline-table
-#    # Rule 3.2
-#    assert_tree(parse_all('<span><tr></tr></span>'), [
-#        ('body', 'Line', [
-#            ('span', 'Inline', [
-#                ('span', 'AnonInlineBlock', [
-#                    ('span', 'AnonInlineTable', [
-#                        ('span', 'AnonTableRowGroup', [
-#                            ('tr', 'TableRow', [])])])])])])])
+    # Rule 3.2
+    assert_tree(parse_all('<span><x-tr></x-tr></span>'), [
+        ('body', 'Line', [
+            ('span', 'Inline', [
+                ('span', 'AnonInlineBlock', [
+                    ('span', 'AnonInlineTable', [
+                        ('span', 'AnonTableRowGroup', [
+                            ('x-tr', 'TableRow', [])])])])])])])
 
-#    # Rule 3.1
-#    # Also, rule 1.3 does not apply: whitespace before and after is preserved
-#    assert_tree(parse_all('''
-#        <span>
-#            <em style="display: table-cell"></em>
-#            <em style="display: table-cell"></em>
-#        </span>
-#    '''), [
-#        ('body', 'Line', [
-#            ('span', 'Inline', [
-#                # Whitespace is preserved in table handling, then collapsed
-#                # into a single space.
-#                ('span', 'Text', ' '),
-#                ('span', 'AnonInlineBlock', [
-#                    ('span', 'AnonInlineTable', [
-#                        ('span', 'AnonTableRowGroup', [
-#                            ('span', 'AnonTableRow', [
-#                                ('em', 'TableCell', []),
-#                                ('em', 'TableCell', [])])])])]),
-#                ('span', 'Text', ' ')])])])
+    # Rule 3.1
+    # Also, rule 1.3 does not apply: whitespace before and after is preserved
+    assert_tree(parse_all('''
+        <span>
+            <em style="display: table-cell"></em>
+            <em style="display: table-cell"></em>
+        </span>
+    '''), [
+        ('body', 'Line', [
+            ('span', 'Inline', [
+                # Whitespace is preserved in table handling, then collapsed
+                # into a single space.
+                ('span', 'Text', ' '),
+                ('span', 'AnonInlineBlock', [
+                    ('span', 'AnonInlineTable', [
+                        ('span', 'AnonTableRowGroup', [
+                            ('span', 'AnonTableRow', [
+                                ('em', 'TableCell', []),
+                                ('em', 'TableCell', [])])])])]),
+                ('span', 'Text', ' ')])])])
 
     # Rule 3.2
-    assert_tree(parse_all('<tr></tr>\t<tr></tr>'), [
+    assert_tree(parse_all('<x-tr></x-tr>\t<x-tr></x-tr>'), [
         ('body', 'AnonBlock', [
             ('body', 'AnonTable', [
                 ('body', 'AnonTableRowGroup', [
-                    ('tr', 'TableRow', []),
-                    ('tr', 'TableRow', [])])])])])
-    assert_tree(parse_all('<col></col>\n<colgroup></colgroup>'), [
+                    ('x-tr', 'TableRow', []),
+                    ('x-tr', 'TableRow', [])])])])])
+
+    assert_tree(parse_all('<x-col></x-col>\n<x-colgroup></x-colgroup>'), [
         ('body', 'AnonBlock', [
             ('body', 'AnonTable', [
                 ('body', 'AnonTableColumnGroup', [
-                    ('col', 'TableColumn', [])]),
-                ('colgroup', 'TableColumnGroup', [
-                    ('colgroup', 'AnonTableColumn', [])])])])])
+                    ('x-col', 'TableColumn', [])]),
+                ('x-colgroup', 'TableColumnGroup', [
+                    ('x-colgroup', 'AnonTableColumn', [])])])])])
 
 
 @assert_no_logs
@@ -736,7 +756,6 @@ def test_colspan_rowspan():
         [1, 1],
     ]
 
-
     # A cell box cannot extend beyond the last row box of a table.
     html = parse_all('''
         <table>
@@ -838,20 +857,29 @@ def test_before_after():
                     ('q', 'Text', ' sit amet'),
                     ('q:after', 'Inline', [
                         ('q:after', 'Text', ' »')])])])])])
+    with capture_logs() as logs:
+        assert_tree(parse_all('''
+            <style>
+                p:before {
+                    content: 'a' url(pattern.png) 'b';
 
-    assert_tree(parse_all('''
-        <style>
-            p:before { content: 'a' url(pattern.png) 'b'}
-        </style>
-        <p>c</p>
-    '''), [
-        ('p', 'Block', [
-            ('p', 'Line', [
-                ('p:before', 'Inline', [
-                    ('p:before', 'Text', 'a'),
-                    ('p:before', 'AnonInlineReplaced', '<replaced>'),
-                    ('p:before', 'Text', 'b')]),
-                ('p', 'Text', 'c')])])])
+                    /* Invalid, ignored in favor of the one above.
+                       Regression test: this used to crash: */
+                    content: some-function(nested-function(something));
+                }
+            </style>
+            <p>c</p>
+        '''), [
+            ('p', 'Block', [
+                ('p', 'Line', [
+                    ('p:before', 'Inline', [
+                        ('p:before', 'Text', 'a'),
+                        ('p:before', 'AnonInlineReplaced', '<replaced>'),
+                        ('p:before', 'Text', 'b')]),
+                    ('p', 'Text', 'c')])])])
+    assert len(logs) == 1
+    assert 'nested-function(' in logs[0]
+    assert 'invalid value' in logs[0]
 
 
 @assert_no_logs
@@ -875,8 +903,7 @@ def test_counters():
         <p></p>
         <p style="counter-reset: p 42"></p>
         <p></p>
-        <p></p>
-    '''), [
+        <p></p>'''), [
         ('p', 'Block', [
             ('p', 'Line', [
                 ('p:before', 'Inline', [
@@ -894,8 +921,7 @@ def test_counters():
                 <li></li>
             </ol></li>
             <li></li>
-        </ol>
-    '''), [
+        </ol>'''), [
         ('ol', 'Block', [
             ('li', 'Block', [
                 ('li', 'Line', [
@@ -933,8 +959,7 @@ def test_counters():
             <p></p>
             <p style="counter-reset: list-item 7 list-item -56"></p>
         </div>
-        <p></p>
-    '''), [
+        <p></p>'''), [
         ('div', 'Block', [
             ('p', 'Block', [
                 ('p', 'Line', [
@@ -955,17 +980,14 @@ def test_counters():
             h1:before { counter-increment: h; content: counters(h, '.') }
         </style>
         <body>
-            <section>
+            <section><h1></h1>
                 <h1></h1>
-                <h1></h1>
-                <section>
-                    <h1></h1>
+                <section><h1></h1>
                     <h1></h1>
                 </section>
                 <h1></h1>
             </section>
-        </body>
-    '''), [
+        </body>'''), [
         ('section', 'Block', [
             ('section', 'AnonBlock', [
                 ('section', 'Line', [
@@ -1004,8 +1026,7 @@ def test_counters():
                 Scope created now, deleted after the div
             </span>
         </div>
-        <p>
-    '''), [
+        <p></p>'''), [
         ('div', 'Block', [
             ('div', 'Line', [
                 ('span', 'Inline', [
@@ -1019,11 +1040,10 @@ def test_counters():
     # counter-increment may interfere with display: list-item
     assert_tree(parse_all('''
         <p style="counter-increment: c;
-                  display: list-item; list-style: inside decimal">
-    '''), [
+                  display: list-item; list-style: inside decimal">'''), [
         ('p', 'Block', [
             ('p', 'Line', [
-                    ('p::marker', 'Text', '0.')])])])
+                ('p::marker', 'Text', '0.')])])])
 
 
 @assert_no_logs
@@ -1178,7 +1198,7 @@ def test_margin_boxes():
     """
     Test that the correct margin boxes are created.
     """
-    document = TestPNGDocument('''
+    page_1, page_2 = render_pages('''
         <style>
             @page {
                 /* Make the page content area only 10px high and wide,
@@ -1194,7 +1214,6 @@ def test_margin_boxes():
         </style>
         <p>lorem ipsum
     ''')
-    page_1, page_2 = document.pages
     assert page_1.children[0].element_tag == 'html'
     assert page_2.children[0].element_tag == 'html'
 
@@ -1213,7 +1232,7 @@ def test_margin_boxes():
 @assert_no_logs
 def test_page_counters():
     """Test page-based counters."""
-    document = TestPNGDocument('''
+    pages = render_pages('''
         <style>
             @page {
                 /* Make the page content area only 10px high and wide,
@@ -1227,8 +1246,122 @@ def test_page_counters():
         </style>
         <p>lorem ipsum dolor
     ''')
-    for page_number, page in enumerate(document.pages, 1):
+    for page_number, page in enumerate(pages, 1):
         html, bottom_center = page.children
         line_box, = bottom_center.children
         text_box, = line_box.children
         assert text_box.text == 'Page {0} of 3.'.format(page_number)
+
+
+@assert_no_logs
+def test_border_collapse():
+    html = parse_all('<table></table>')
+    body, = html.children
+    table_wrapper, = body.children
+    table, = table_wrapper.children
+    assert isinstance(table, boxes.TableBox)
+    assert not hasattr(table, 'collapsed_border_grid')
+
+    def get_grid(html):
+        html = parse_all(html)
+        body, = html.children
+        table_wrapper, = body.children
+        table, = table_wrapper.children
+        return tuple(
+            [[(style, width, color) if width else None
+              for _score, (style, width, color) in column]
+             for column in grid]
+            for grid in table.collapsed_border_grid)
+
+    grid = get_grid('<table style="border-collapse: collapse"></table>')
+    assert grid == ([], [])
+
+    black = (0, 0, 0, 1)
+    red = (1, 0, 0, 1)
+    green = (0, 1, 0, 1)  # lime in CSS
+    blue = (0, 0, 1, 1)
+    yellow = (1, 1, 0, 1)
+
+    vertical_borders, horizontal_borders = get_grid('''
+        <style>td { border: 1px solid red }</style>
+        <table style="border-collapse: collapse; border: 3px solid black">
+            <tr> <td>A</td> <td>B</td> </tr>
+            <tr> <td>C</td> <td>D</td> </tr>
+        </table>
+    ''')
+    black_3 = ('solid', 3, black)
+    red_1 = ('solid', 1, red)
+    assert vertical_borders == [
+        [black_3, red_1, black_3],
+        [black_3, red_1, black_3],
+    ]
+    assert horizontal_borders == [
+        [black_3, black_3],
+        [red_1, red_1],
+        [black_3, black_3],
+    ]
+
+    # hidden vs. none
+    vertical_borders, horizontal_borders = get_grid('''
+        <style>table, td { border: 3px solid }</style>
+        <table style="border-collapse: collapse">
+            <tr> <td>A</td> <td style="border-style: hidden">B</td> </tr>
+            <tr> <td>C</td> <td style="border-style: none">D</td> </tr>
+        </table>
+    ''')
+    assert vertical_borders == [
+        [black_3, None, None],
+        [black_3, black_3, black_3],
+    ]
+    assert horizontal_borders == [
+        [black_3, None],
+        [black_3, None],
+        [black_3, black_3],
+    ]
+
+    yellow_5 = ('solid', 5, yellow)
+    green_5 = ('solid', 5, green)
+    dashed_blue_5 = ('dashed', 5, blue)
+    vertical_borders, horizontal_borders = get_grid('''
+        <style>td { border: 1px solid red }</style>
+        <table style="border-collapse: collapse; border: 5px solid yellow">
+            <col style="border: 3px solid black" />
+            <tr> <td></td> <td></td> <td></td> </tr>
+            <tr> <td></td> <td style="border: 5px dashed blue"></td>
+                 <td style="border: 5px solid lime"></td> </tr>
+            <tr> <td></td> <td></td> <td></td> </tr>
+            <tr> <td></td> <td></td> <td></td> </tr>
+        </table>
+    ''')
+    assert vertical_borders == [
+        [yellow_5, black_3, red_1, yellow_5],
+        [yellow_5, dashed_blue_5, green_5, green_5],
+        [yellow_5, black_3, red_1, yellow_5],
+        [yellow_5, black_3, red_1, yellow_5],
+    ]
+    assert horizontal_borders == [
+        [yellow_5, yellow_5, yellow_5],
+        [red_1, dashed_blue_5, green_5],
+        [red_1, dashed_blue_5, green_5],
+        [red_1, red_1, red_1],
+        [yellow_5, yellow_5, yellow_5],
+    ]
+
+    # rowspan and colspan
+    vertical_borders, horizontal_borders = get_grid('''
+        <style>col, tr { border: 3px solid }</style>
+        <table style="border-collapse: collapse">
+            <col /><col /><col />
+            <tr> <td rowspan=2></td> <td></td> <td></td> </tr>
+            <tr>                     <td colspan=2></td> </tr>
+        </table>
+    ''')
+    assert vertical_borders == [
+        [black_3, black_3, black_3, black_3],
+        [black_3, black_3, None, black_3],
+    ]
+    assert horizontal_borders == [
+        [black_3, black_3, black_3],
+        [None, black_3, black_3],
+        [black_3, black_3, black_3],
+    ]

@@ -5,40 +5,33 @@
 
     Test the CSS parsing, cascade, inherited and computed values.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
 
-import os.path
-
 from pytest import raises
 
 from .testing_utils import (
-    resource_filename, assert_no_logs, capture_logs, TestPNGDocument)
+    resource_filename, assert_no_logs, capture_logs, TestHTML)
 from .. import css
+from ..css import get_all_computed_styles
 from ..css.computed_values import strut_layout
-from ..urls import open_data_url
-from .. import CSS
-
-
-def parse_html(filename, **kwargs):
-    """Parse an HTML file from the test resources and resolve relative URL."""
-    filename = resource_filename(filename)
-    with open(filename, 'rb') as fd:
-        return TestPNGDocument(fd.read(), base_url=filename, **kwargs)
+from ..urls import open_data_url, path2url
+from .. import CSS, default_url_fetcher
 
 
 @assert_no_logs
 def test_data_url():
     """Test URLs with the "data:" scheme."""
     def parse(url, expected_content, expected_mime_type, expected_charset):
-        file_like, mime_type, charset = open_data_url(url)
-        assert file_like.read() == expected_content
-        assert mime_type == expected_mime_type
-        assert charset == expected_charset
+        assert open_data_url(url) == dict(
+            string=expected_content,
+            mime_type=expected_mime_type,
+            encoding=expected_charset,
+            redirected_url=url)
     parse('data:,foo', b'foo', 'text/plain', 'US-ASCII')
     parse('data:,foo%22bar', b'foo"bar', 'text/plain', 'US-ASCII')
     parse('data:text/plain,foo', b'foo', 'text/plain', None)
@@ -79,9 +72,10 @@ def test_style_dict():
 @assert_no_logs
 def test_find_stylesheets():
     """Test if the stylesheets are found in a HTML document."""
-    document = parse_html('doc1.html')
+    document = TestHTML(resource_filename('doc1.html'))
 
-    sheets = list(css.find_stylesheets(document, 'print'))
+    sheets = list(css.find_stylesheets(
+        document.root_element, 'print', default_url_fetcher))
     assert len(sheets) == 2
     # Also test that stylesheets are in tree order
     assert [s.base_url.rsplit('/', 1)[-1].rsplit(',', 1)[-1] for s in sheets] \
@@ -131,53 +125,52 @@ def test_annotate_document():
     """Test a document with inline style."""
     # Short names for variables are OK here
     # pylint: disable=C0103
-
-    document = parse_html(
-        'doc1.html',
-        user_stylesheets=[CSS(resource_filename('user.css'))],
-        user_agent_stylesheets=[CSS(resource_filename('mini_ua.css'))],
-    )
+    document = TestHTML(resource_filename('doc1.html'))
+    document._ua_stylesheets = lambda: [CSS(resource_filename('mini_ua.css'))]
+    style_for = get_all_computed_styles(
+        document, user_stylesheets=[CSS(resource_filename('user.css'))])
 
     # Element objects behave a lists of their children
-    _head, body = document.dom
+    _head, body = document.root_element
     h1, p, ul = body
     li_0, _li_1 = ul
     a, = li_0
 
-    h1 = document.style_for(h1)
-    p = document.style_for(p)
-    ul = document.style_for(ul)
-    li_0 = document.style_for(li_0)
-    after = document.style_for(a, 'after')
-    a = document.style_for(a)
+    h1 = style_for(h1)
+    p = style_for(p)
+    ul = style_for(ul)
+    li_0 = style_for(li_0)
+    after = style_for(a, 'after')
+    a = style_for(a)
 
-    assert h1.background_image == 'file://' \
-        + os.path.abspath(resource_filename('logo_small.png'))
+    assert h1.background_image == [
+        ('url', path2url(resource_filename('logo_small.png')))]
 
     assert h1.font_weight == 700
-    assert h1.font_size == 32  # 4ex
+    assert h1.font_size == 40  # 2em
 
-    # 32px = 1em * font-size = x-large = 3/2 * initial 16px = 24px
+    # x-large * initial = 3/2 * 16 = 24
     assert p.margin_top == (24, 'px')
     assert p.margin_right == (0, 'px')
     assert p.margin_bottom == (24, 'px')
     assert p.margin_left == (0, 'px')
-    assert p.background_color == (0, 0, 1, 1)  # blue
+    assert p.background_color == 'currentColor'  # resolved at use-value time.
 
-    # 80px = 2em * 5ex = 10 * half of initial 16px
-    assert ul.margin_top == (80, 'px')
-    assert ul.margin_right == (80, 'px')
-    assert ul.margin_bottom == (80, 'px')
-    assert ul.margin_left == (80, 'px')
+    # 2em * 1.25ex = 2 * 20 * 1.25 * 0.8 = 40
+    # 2.5ex * 1.25ex = 2.5 * 0.8 * 20 * 1.25 * 0.8 = 40
+    assert ul.margin_top == (40, 'px')
+    assert ul.margin_right == (40, 'px')
+    assert ul.margin_bottom == (40, 'px')
+    assert ul.margin_left == (40, 'px')
 
-    assert ul.font_weight == 700
+    assert ul.font_weight == 400
     # thick = 5px, 0.25 inches = 96*.25 = 24px
     assert ul.border_top_width == 0
     assert ul.border_right_width == 5
     assert ul.border_bottom_width == 0
     assert ul.border_left_width == 24
 
-    assert li_0.font_weight == 900
+    assert li_0.font_weight == 700
     assert li_0.font_size == 8  # 6pt
     assert li_0.margin_top == (16, 'px')  # 2em
     assert li_0.margin_right == (0, 'px')
@@ -185,6 +178,7 @@ def test_annotate_document():
     assert li_0.margin_left == (32, 'px')  # 4em
 
     assert a.text_decoration == frozenset(['underline'])
+    assert a.font_weight == 900
     assert a.font_size == 24  # 300% of 8px
     assert a.padding_top == (1, 'px')
     assert a.padding_right == (2, 'px')
@@ -193,10 +187,8 @@ def test_annotate_document():
     assert a.border_top_width == 42
     assert a.border_bottom_width == 42
 
-
     assert a.color == (1, 0, 0, 1)
-    # Test the initial border-color: currentColor
-    assert a.border_top_color == (1, 0, 0, 1)
+    assert a.border_top_color == 'currentColor'
 
     # The href attr should be as in the source, not made absolute.
     assert after.content == [
@@ -212,19 +204,11 @@ def test_annotate_document():
 
 
 @assert_no_logs
-def test_default_stylesheet():
-    """Test if the user-agent stylesheet is used and applied."""
-    document = parse_html('doc1.html')
-    head_style = document.style_for(document.dom.head)
-    assert head_style.display == 'none', \
-        'The HTML4 user-agent stylesheet was not applied'
-
-
-@assert_no_logs
 def test_page():
     """Test the ``@page`` properties."""
-    document = parse_html('doc1.html', user_stylesheets=[
-        CSS(string='''
+    document = TestHTML(resource_filename('doc1.html'))
+    style_for = get_all_computed_styles(
+        document, user_stylesheets=[CSS(string='''
             html {
                 color: red;
             }
@@ -242,41 +226,40 @@ def test_page():
                     font-size: 10px;
                 }
             }
-        ''')
-    ])
+        ''')])
 
-    style = document.style_for('first_left_page')
+    style = style_for('first_left_page')
     assert style.margin_top == (5, 'px')
     assert style.margin_left == (10, 'px')
     assert style.margin_bottom == (10, 'px')
     assert style.color == (1, 0, 0, 1)  # red, inherited from html
 
-    style = document.style_for('first_right_page')
+    style = style_for('first_right_page')
     assert style.margin_top == (5, 'px')
     assert style.margin_left == (10, 'px')
     assert style.margin_bottom == (16, 'px')
     assert style.color == (0, 0, 1, 1)  # blue
 
-    style = document.style_for('left_page')
+    style = style_for('left_page')
     assert style.margin_top == (10, 'px')
     assert style.margin_left == (10, 'px')
     assert style.margin_bottom == (10, 'px')
     assert style.color == (1, 0, 0, 1)  # red, inherited from html
 
-    style = document.style_for('right_page')
+    style = style_for('right_page')
     assert style.margin_top == (10, 'px')
     assert style.margin_left == (10, 'px')
     assert style.margin_bottom == (16, 'px')
     assert style.color == (0, 0, 1, 1)  # blue
 
-    style = document.style_for('first_left_page', '@top-left')
+    style = style_for('first_left_page', '@top-left')
     assert style is None
 
-    style = document.style_for('first_right_page', '@top-left')
+    style = style_for('first_right_page', '@top-left')
     assert style.font_size == 20  # inherited from @page
     assert style.width == (200, 'px')
 
-    style = document.style_for('first_right_page', '@top-right')
+    style = style_for('first_right_page', '@top-right')
     assert style.font_size == 10
 
 
@@ -284,50 +267,56 @@ def test_page():
 def test_warnings():
     """Check that appropriate warnings are logged."""
     for source, messages in [
-        ('<style>:lipsum { margin: 2cm',
+        (':lipsum { margin: 2cm',
             ['WARNING: Invalid or unsupported selector']),
-        ('<style>::lipsum { margin: 2cm',
+        ('::lipsum { margin: 2cm',
             ['WARNING: Invalid or unsupported selector']),
-        ('<style>@page foo { margin: 2cm',
+        ('@page foo { margin: 2cm',
             ['WARNING: Named pages are not supported yet']),
-        ('<link rel=stylesheet href=data:image/png,>',
-            ['WARNING: Unsupported stylesheet type: image/png']),
-        ('<style>foo { margin-color: red',
+        ('foo { margin-color: red',
             ['WARNING: Ignored', 'unknown property']),
-        ('<style>foo { margin-top: red',
+        ('foo { margin-top: red',
             ['WARNING: Ignored', 'invalid value']),
-        ('<html style="margin-color: red">',
-            ['WARNING: Ignored', 'unknown property']),
-        ('<html style="margin-top: red">',
-            ['WARNING: Ignored', 'invalid value']),
+        ('@import "relative-uri.css',
+            ['WARNING: Relative URI reference without a base URI']),
+        ('@import "invalid-protocol://absolute-URL',
+            ['WARNING: Failed to load stylesheet at']),
     ]:
         with capture_logs() as logs:
-            TestPNGDocument(source).style_for('')
+            CSS(string=source)
         assert len(logs) == 1
         for message in messages:
             assert message in logs[0]
+
+    html = '<link rel=stylesheet href=invalid-protocol://absolute>'
+    with capture_logs() as logs:
+        TestHTML(string=html).render()
+    assert len(logs) == 1
+    assert 'WARNING: Failed to load stylesheet at' in logs[0]
 
 
 @assert_no_logs
 def test_error_recovery():
     with capture_logs() as logs:
-        document = TestPNGDocument('''
+        document = TestHTML(string='''
             <style> html { color red; color: blue; color
         ''')
-        html = document.formatting_structure
+        page, = document.render().pages
+        html, = page._page_box.children
         assert html.style.color == (0, 0, 1, 1)  # blue
 
-        document = TestPNGDocument('''
+        document = TestHTML(string='''
             <html style="color; color: blue; color red">
         ''')
-        html = document.formatting_structure
+        page, = document.render().pages
+        html, = page._page_box.children
         assert html.style.color == (0, 0, 1, 1)  # blue
     assert len(logs) == 4
 
 
 @assert_no_logs
 def test_line_height_inheritance():
-    document = TestPNGDocument('''
+    document = TestHTML(string='''
         <style>
             html { font-size: 10px; line-height: 140% }
             section { font-size: 10px; line-height: 1.4 }
@@ -335,7 +324,8 @@ def test_line_height_inheritance():
         </style>
         <body><div><section><p></p></section></div></body>
     ''')
-    html = document.formatting_structure
+    page, = document.render().pages
+    html, = page._page_box.children
     body, = html.children
     div, = body.children
     section, = div.children
@@ -354,7 +344,7 @@ def test_line_height_inheritance():
 
 @assert_no_logs
 def test_important():
-    document = TestPNGDocument('''
+    document = TestHTML(string='''
         <style>
             p:nth-child(1) { color: lime }
             body p:nth-child(2) { color: red }
@@ -374,14 +364,39 @@ def test_important():
         <p></p>
         <p></p>
         <p></p>
-    ''', user_stylesheets=[CSS(string='''
-            body p:nth-child(1) { color: red }
-            p:nth-child(2) { color: lime !important }
+    ''')
+    page, = document.render(stylesheets=[CSS(string='''
+        body p:nth-child(1) { color: red }
+        p:nth-child(2) { color: lime !important }
 
-            p:nth-child(4) { color: lime !important }
-            body p:nth-child(4) { color: red }
-    ''')])
-    html = document.formatting_structure
+        p:nth-child(4) { color: lime !important }
+        body p:nth-child(4) { color: red }
+    ''')]).pages
+    html, = page._page_box.children
     body, = html.children
     for paragraph in body.children:
         assert paragraph.style.color == (0, 1, 0, 1)  # lime (light green)
+
+
+@assert_no_logs
+def test_units():
+    document = TestHTML(string='''
+        <p style="margin-left: 96px"></p>
+        <p style="margin-left: 1in"></p>
+        <p style="margin-left: 72pt"></p>
+        <p style="margin-left: 6pc"></p>
+        <p style="margin-left: 2.54cm"></p>
+        <p style="margin-left: 25.4mm"></p>
+        <p style="margin-left: 1.1em"></p>
+        <p style="margin-left: 1.1ch; font: 14px Ahem"></p>
+        <p style="margin-left: 1.5ex; font: 10px Ahem"></p>
+        <p style="margin-left: 1.1ch"></p>
+    ''')
+    page, = document.render().pages
+    html, = page._page_box.children
+    body, = html.children
+    margins = [round(p.margin_left, 6) for p in body.children]
+    default_font_ch = margins.pop()
+    # Ahem: 1ex is 0.8em, 1ch is 1em
+    assert margins == [96, 96, 96, 96, 96, 96, 17.6, 15.4, 12]
+    assert 4 < default_font_ch < 12  # for 1em = 16px

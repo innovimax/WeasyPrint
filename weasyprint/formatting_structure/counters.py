@@ -8,7 +8,7 @@
     These are defined in the same terms as CSS 3 Lists:
     http://dev.w3.org/csswg/css3-lists/#predefined-counters
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
@@ -154,11 +154,11 @@ def additive(symbols, negative, value):
 
 # 'decimal' behaves the same as this, but defining it this way is silly.
 # We’ll special-case it and just use str().
-#register_style(
-#    'decimal',
-#    type='numeric',
-#    symbols='0 1 2 3 4 5 6 7 8 9'.split(),
-#)
+# register_style(
+#     'decimal',
+#     type='numeric',
+#     symbols='0 1 2 3 4 5 6 7 8 9'.split(),
+# )
 register_style(
     'decimal-leading-zero',
     type='non-repeating',
@@ -205,7 +205,7 @@ register_style(
         (9000, 'Ք'), (8000, 'Փ'), (7000, 'Ւ'), (6000, 'Ց'),
         (5000, 'Ր'), (4000, 'Տ'), (3000, 'Վ'), (2000, 'Ս'), (1000, 'Ռ'),
         (900, 'Ջ'), (800, 'Պ'), (700, 'Չ'), (600, 'Ո'),
-        (500, 'Շ'),(400, 'Ն'), (300, 'Յ'), (200, 'Մ'), (100, 'Ճ'),
+        (500, 'Շ'), (400, 'Ն'), (300, 'Յ'), (200, 'Մ'), (100, 'Ճ'),
         (90, 'Ղ'), (80, 'Ձ'), (70, 'Հ'), (60, 'Կ'),
         (50, 'Ծ'), (40, 'Խ'), (30, 'Լ'), (20, 'Ի'), (10, 'Ժ'),
         (9, 'Թ'), (8, 'Ը'), (7, 'Է'), (6, 'Զ'),

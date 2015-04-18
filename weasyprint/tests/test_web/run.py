@@ -7,7 +7,7 @@
     A simple web application made with Flask. Allows to type HTML
     and instantly visualize the result rendered by WeasyPrint.
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
@@ -42,7 +42,7 @@ div { border: 10px solid; background: #ddd; }
 def index():
     if os.path.isfile(INPUT):
         with open(INPUT) as fd:
-            content = fd.read()
+            content = fd.read().decode('utf-8') or DEFAULT_CONTENT
     else:
         content = DEFAULT_CONTENT
     return render_template('index.html.jinja2', content=content)
@@ -57,7 +57,7 @@ def render():
         assert 'fuu' not in html
         # Save the input HTML
         with open(INPUT, 'w') as fd:
-            fd.write(html)
+            fd.write(html.encode('utf-8'))
 
     html = HTML(INPUT, encoding='utf8')
     html.write_pdf(PDF_OUTPUT)

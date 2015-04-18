@@ -24,28 +24,29 @@ r"""
     rather than silently behave incorrectly.
 
 
-    :copyright: Copyright 2011-2012 Simon Sapin and contributors, see AUTHORS.
+    :copyright: Copyright 2011-2014 Simon Sapin and contributors, see AUTHORS.
     :license: BSD, see LICENSE for details.
 
 """
 
 from __future__ import division, unicode_literals
 
+import hashlib
+import io
+import mimetypes
 import os
 import re
 import string
+import sys
+import zlib
 
-import cairo
+import cairocffi as cairo
 
-from . import VERSION_STRING
+from . import VERSION_STRING, Attachment
+from .compat import xrange, iteritems, izip, unquote
+from .urls import iri_to_uri, urlsplit, URLFetchingError
+from .html import W3C_DATE_RE
 from .logger import LOGGER
-from .compat import xrange, iteritems
-from .urls import iri_to_uri
-from .formatting_structure import boxes
-from .css.computed_values import LENGTHS_TO_PIXELS
-
-
-PX_TO_PT = 1 / LENGTHS_TO_PIXELS['pt']
 
 
 class PDFFormatter(string.Formatter):
@@ -201,10 +202,12 @@ class PDFFile(object):
         assert int(line[:-7]) == object_number  # len(b' 0 obj\n') == 7
         object_lines = []
         for line in fileobj:
-            object_lines.append(line)
             if line == b'>>\n':
                 assert next(fileobj) == b'endobj\n'
+                # No newline, we’ll add it when writing.
+                object_lines.append(b'>>')
                 return b''.join(object_lines)
+            object_lines.append(line)
 
     def overwrite_object(self, object_number, byte_string):
         """Write the new content for an existing object at the end of the file.
@@ -223,10 +226,10 @@ class PDFFile(object):
         the << >> delimiters.
 
         """
-        assert dictionary.byte_string.endswith(b'>>\n')
+        assert dictionary.byte_string.endswith(b'>>')
         self.overwrite_object(
             dictionary.object_number,
-            dictionary.byte_string[:-3] + new_content + b'\n>>\n')
+            dictionary.byte_string[:-2] + new_content + b'\n>>')
 
     def next_object_number(self):
         """Return the object number that would be used by write_new_object().
@@ -296,174 +299,375 @@ class PDFFile(object):
         return fileobj.tell(), fileobj.write
 
 
-def process_bookmarks(raw_bookmarks):
-    """Transform a list of bookmarks as found in the document
-    to a data structure ready for PDF.
+def flatten_bookmarks(bookmarks, depth=1):
+    for label, target, children in bookmarks:
+        yield label, target, depth
+        for result in flatten_bookmarks(children, depth + 1):
+            yield result
+
+
+def prepare_metadata(document, bookmark_root_id, scale):
+    """Change metadata into data structures closer to the PDF objects.
+
+    In particular, convert from WeasyPrint units (CSS pixels from
+    the top-left corner) to PDF units (points from the bottom-left corner.)
+
+    :param scale:
+        PDF points per CSS pixels.
+        Defaults to 0.75, but is affected by `zoom` in
+        :meth:`weasyprint.document.Document.write_pdf`.
 
     """
-    root = {'Count': 0}
+    # X and width unchanged;  Y’ = page_height - Y;  height’ = -height
+    matrices = [cairo.Matrix(xx=scale, yy=-scale, y0=page.height * scale)
+                for page in document.pages]
+    links = []
+    for page_links, matrix in izip(document.resolve_links(), matrices):
+        new_page_links = []
+        for link_type, target, rectangle in page_links:
+            if link_type == 'internal':
+                target_page, target_x, target_y = target
+                target = (
+                    (target_page,) +
+                    matrices[target_page].transform_point(target_x, target_y))
+            rect_x, rect_y, width, height = rectangle
+            rect_x, rect_y = matrix.transform_point(rect_x, rect_y)
+            width, height = matrix.transform_distance(width, height)
+            # x, y, w, h => x0, y0, x1, y1
+            rectangle = rect_x, rect_y, rect_x + width, rect_y + height
+            new_page_links.append((link_type, target, rectangle))
+        links.append(new_page_links)
+
+    bookmark_root = {'Count': 0}
     bookmark_list = []
-
-    level_shifts = []
-    last_by_level = [root]
-    indices_by_level = [0]
-
-    for i, (level, label, destination) in enumerate(raw_bookmarks, start=1):
-        # Calculate the real level of the bookmark
-        previous_level = len(last_by_level) - 1 + sum(level_shifts)
-        if level > previous_level:
-            level_shifts.append(level - previous_level - 1)
-        else:
-            k = 0
-            while k < previous_level - level:
-                k += 1 + level_shifts.pop()
-
-        # Resolve level inconsistencies
-        level -= sum(level_shifts)
-
+    last_id_by_depth = [bookmark_root_id]
+    last_by_depth = [bookmark_root]
+    for bookmark_id, (label, target, depth) in enumerate(
+            flatten_bookmarks(document.make_bookmark_tree()),
+            bookmark_root_id + 1):
+        target_page, target_x, target_y = target
+        target = (target_page,) + matrices[target_page].transform_point(
+            target_x, target_y)
         bookmark = {
             'Count': 0, 'First': None, 'Last': None, 'Prev': None,
-            'Next': None, 'Parent': indices_by_level[level - 1],
-            'label': label, 'destination': destination}
+            'Next': None, 'Parent': last_id_by_depth[depth - 1],
+            'label': label, 'target': target}
 
-        if level > len(last_by_level) - 1:
-            last_by_level[level - 1]['First'] = i
+        if depth > len(last_by_depth) - 1:
+            last_by_depth[depth - 1]['First'] = bookmark_id
         else:
-            # The bookmark is sibling of indices_by_level[level]
-            bookmark['Prev'] = indices_by_level[level]
-            last_by_level[level]['Next'] = i
+            # The bookmark is sibling of last_id_by_depth[depth]
+            bookmark['Prev'] = last_id_by_depth[depth]
+            last_by_depth[depth]['Next'] = bookmark_id
 
-            # Remove the bookmarks with a level higher than the current one
-            del last_by_level[level:]
-            del indices_by_level[level:]
+            # Remove the bookmarks with a depth higher than the current one
+            del last_by_depth[depth:]
+            del last_id_by_depth[depth:]
 
-        for count_level in range(level):
-            last_by_level[count_level]['Count'] += 1
-        last_by_level[level - 1]['Last'] = i
+        for i in range(depth):
+            last_by_depth[i]['Count'] += 1
+        last_by_depth[depth - 1]['Last'] = bookmark_id
 
-        last_by_level.append(bookmark)
-        indices_by_level.append(i)
+        last_by_depth.append(bookmark)
+        last_id_by_depth.append(bookmark_id)
         bookmark_list.append(bookmark)
+    return bookmark_root, bookmark_list, links
 
-    return root, bookmark_list
+
+def _write_compressed_file_object(pdf, file):
+    """
+    Write a file like object as ``/EmbeddedFile``, compressing it with deflate.
+    In fact, this method writes multiple PDF objects to include length,
+    compressed length and MD5 checksum.
+
+    :return:
+        the object number of the compressed file stream object
+    """
+
+    object_number = pdf.next_object_number()
+    # Make sure we stay in sync with our object numbers
+    expected_next_object_number = object_number + 4
+
+    length_number = object_number + 1
+    md5_number = object_number + 2
+    uncompressed_length_number = object_number + 3
+
+    offset, write = pdf._start_writing()
+    write(pdf_format('{0} 0 obj\n', object_number))
+    write(pdf_format(
+        '<< /Type /EmbeddedFile /Length {0} 0 R /Filter '
+        '/FlateDecode /Params << /CheckSum {1} 0 R /Size {2} 0 R >> >>\n',
+        length_number, md5_number, uncompressed_length_number))
+    write(b'stream\n')
+
+    uncompressed_length = 0
+    compressed_length = 0
+
+    md5 = hashlib.md5()
+    compress = zlib.compressobj()
+    for data in iter(lambda: file.read(4096), b''):
+        uncompressed_length += len(data)
+
+        md5.update(data)
+
+        compressed = compress.compress(data)
+        compressed_length += len(compressed)
+
+        write(compressed)
+
+    compressed = compress.flush(zlib.Z_FINISH)
+    compressed_length += len(compressed)
+    write(compressed)
+
+    write(b'\nendstream\n')
+    write(b'endobj\n')
+
+    pdf.new_objects_offsets.append(offset)
+
+    pdf.write_new_object(pdf_format("{0}", compressed_length))
+    pdf.write_new_object(pdf_format("<{0}>", md5.hexdigest()))
+    pdf.write_new_object(pdf_format("{0}", uncompressed_length))
+
+    assert pdf.next_object_number() == expected_next_object_number
+
+    return object_number
 
 
-def gather_metadata(document):
-    """Traverse the layout tree (boxes) to find all metadata."""
-    def walk(box):
-        # "Border area. That's the area that hit-testing is done on."
-        # http://lists.w3.org/Archives/Public/www-style/2012Jun/0318.html
-        if box.bookmark_label and box.bookmark_level:
-            pos_x, pos_y, _, _ = box.hit_area()
-            pos_x, pos_y = point_to_pdf(pos_x, pos_y)
-            bookmarks.append((
-                box.bookmark_level,
-                box.bookmark_label,
-                (page_index, pos_x, pos_y)))
+def _get_filename_from_result(url, result):
+    """
+    Derives a filename from a fetched resource. This is either the filename
+    returned by the URL fetcher, the last URL path component or a synthetic
+    name if the URL has no path
+    """
 
-        # 'link' is inherited but redundant on text boxes
-        if box.style.link and not isinstance(box, boxes.TextBox):
-            pos_x, pos_y, width, height = box.hit_area()
-            pos_x, pos_y = point_to_pdf(pos_x, pos_y)
-            width, height = distance_to_pdf(width, height)
-            page_links.append(
-                (box, (pos_x, pos_y, pos_x + width, pos_y + height)))
+    filename = None
 
-        if box.style.anchor and box.style.anchor not in anchors:
-            pos_x, pos_y, _, _ = box.hit_area()
-            pos_x, pos_y = point_to_pdf(pos_x, pos_y)
-            anchors[box.style.anchor] = (page_index, pos_x, pos_y)
+    # A given filename will always take precedence
+    if result:
+        filename = result.get('filename')
+        if filename:
+            return filename
 
-        if isinstance(box, boxes.ParentBox):
-            for child in box.children:
-                walk(child)
+    # The URL path likely contains a filename, which is a good second guess
+    if url:
+        split = urlsplit(url)
+        if split.scheme != 'data':
+            filename = split.path.split("/")[-1]
+            if filename == '':
+                filename = None
 
-    bookmarks = []
-    links_by_page = []
-    anchors = {}
-    for page_index, page in enumerate(document.pages):
-        # cairo coordinates are pixels right and down from the top-left corner
-        # PDF coordinates are points right and up from the bottom-left corner
-        matrix = cairo.Matrix(
-            PX_TO_PT, 0, 0, -PX_TO_PT, 0, page.margin_height() * PX_TO_PT)
-        point_to_pdf = matrix.transform_point
-        distance_to_pdf = matrix.transform_distance
-        page_links = []
-        walk(page)
-        links_by_page.append(page_links)
+    if filename is None:
+        # The URL lacks a path altogether. Use a synthetic name.
 
-    # A list (by page) of lists of either:
-    # ('external', uri, rectangle) or
-    # ('internal', (page_index, target_x, target_y), rectangle)
-    resolved_links_by_page = []
-    for page_links in links_by_page:
-        resolved_page_links = []
-        for box, rectangle in page_links:
-            type_, href = box.style.link
-            if type_ == 'internal':
-                target = anchors.get(href)
-                if target is None:
-                    LOGGER.warn(
-                        'No anchor #%s for internal URI reference at line %s'
-                        % (href, box.sourceline))
-                else:
-                    resolved_page_links.append((type_, target, rectangle))
+        # Using guess_extension is a great idea, but sadly the extension is
+        # probably random, depending on the alignment of the stars, which car
+        # you're driving and which software has been installed on your machine.
+        #
+        # Unfortuneatly this isn't even imdepodent on one machine, because the
+        # extension can depend on PYTHONHASHSEED if mimetypes has multiple
+        # extensions to offer
+        extension = None
+        if result:
+            mime_type = result.get('mime_type')
+            if mime_type == 'text/plain':
+                # text/plain has a phletora of extensions - all garbage
+                extension = '.txt'
             else:
-                # external link:
-                resolved_page_links.append((type_, href, rectangle))
-        resolved_links_by_page.append(resolved_page_links)
+                extension = mimetypes.guess_extension(mime_type) or '.bin'
+        else:
+            extension = '.bin'
 
-    return process_bookmarks(bookmarks), resolved_links_by_page
+        filename = 'attachment' + extension
+    else:
+        if sys.version_info[0] < 3:
+            # Python 3 unquotes with UTF-8 per default, here we have to do it
+            # manually
+            # TODO: this assumes that the filename has been quoted as UTF-8.
+            # I'm not sure if this assumption holds, as there is some magic
+            # involved with filesystem encoding in other parts of the code
+            filename = unquote(filename)
+            if not isinstance(filename, bytes):
+                filename = filename.encode('latin1')
+            filename = filename.decode('utf-8')
+        else:
+            filename = unquote(filename)
+
+    return filename
 
 
-def write_pdf_metadata(document, fileobj):
-    bookmarks, links = gather_metadata(document)
+def _write_pdf_embedded_files(pdf, attachments, url_fetcher):
+    """
+    Writes attachments as embedded files (document attachments).
 
+    :return:
+        the object number of the name dictionary or :obj:`None`
+    """
+
+    file_spec_ids = []
+    for attachment in attachments:
+        file_spec_id = _write_pdf_attachment(pdf, attachment, url_fetcher)
+        if file_spec_id is not None:
+            file_spec_ids.append(file_spec_id)
+
+    # We might have failed to write any attachment at all
+    if len(file_spec_ids) == 0:
+        return None
+
+    content = [b'<< /Names [']
+    for fs in file_spec_ids:
+        content.append(pdf_format('\n(attachment{0}) {0} 0 R ',
+                       fs))
+    content.append(b'\n] >>')
+    return pdf.write_new_object(b''.join(content))
+
+
+def _write_pdf_attachment(pdf, attachment, url_fetcher):
+    """
+    Writes an attachment to the PDF stream
+
+    :return:
+        the object number of the ``/Filespec`` object or :obj:`None` if the
+        attachment couldn't be read.
+    """
+    try:
+        # Attachments from document links like <link> or <a> can only be URLs.
+        # They're passed in as tuples
+        if isinstance(attachment, tuple):
+            url, description = attachment
+            attachment = Attachment(
+                url=url, url_fetcher=url_fetcher, description=description)
+        elif not isinstance(attachment, Attachment):
+            attachment = Attachment(guess=attachment, url_fetcher=url_fetcher)
+    except URLFetchingError as exc:
+        LOGGER.warning('Failed to load attachment: %s', exc)
+        return None
+
+    with attachment.source as (source_type, source, url, _):
+        if isinstance(source, bytes):
+            source = io.BytesIO(source)
+
+        file_stream_id = _write_compressed_file_object(pdf, source)
+
+    # TODO: Use the result object from a URL fetch operation to provide more
+    # details on the possible filename
+    filename = _get_filename_from_result(url, None)
+
+    return pdf.write_new_object(pdf_format(
+        '<< /Type /Filespec /F () /UF {0!P} /EF << /F {1} 0 R >> '
+        '/Desc {2!P}\n>>',
+        filename,
+        file_stream_id,
+        attachment.description or ''))
+
+
+def _write_pdf_annotation_files(pdf, links, url_fetcher):
+    """
+    Write all annotation attachments to the PDF file.
+
+    :return:
+        a dictionary that maps URLs to PDF object numbers, which can be
+        :obj:`None` if the resource failed to load.
+    """
+    annot_files = {}
+    for page_links in links:
+        for link_type, target, rectangle in page_links:
+            if link_type == 'attachment' and target not in annot_files:
+                annot_files[target] = None
+                # TODO: use the title attribute as description
+                annot_files[target] = _write_pdf_attachment(
+                    pdf, (target, None), url_fetcher)
+    return annot_files
+
+
+def write_pdf_metadata(document, fileobj, scale, metadata, attachments,
+                       url_fetcher):
+    """Append to a seekable file-like object to add PDF metadata."""
     pdf = PDFFile(fileobj)
-    pdf.overwrite_object(pdf.info.object_number, pdf_format(
-        '<< /Producer {producer!P} >>',
-        producer=VERSION_STRING))
+    bookmark_root_id = pdf.next_object_number()
+    bookmark_root, bookmarks, links = prepare_metadata(
+        document, bookmark_root_id, scale)
 
-    root, bookmarks = bookmarks
     if bookmarks:
-        bookmark_root = pdf.next_object_number()
         pdf.write_new_object(pdf_format(
             '<< /Type /Outlines /Count {0} /First {1} 0 R /Last {2} 0 R\n>>',
-            root['Count'],
-            root['First'] + bookmark_root,
-            root['Last'] + bookmark_root))
-        pdf.extend_dict(pdf.catalog, pdf_format(
-            '/Outlines {0} 0 R /PageMode /UseOutlines', bookmark_root))
+            bookmark_root['Count'],
+            bookmark_root['First'],
+            bookmark_root['Last']))
         for bookmark in bookmarks:
             content = [pdf_format('<< /Title {0!P}\n', bookmark['label'])]
+            page_num, pos_x, pos_y = bookmark['target']
             content.append(pdf_format(
-                '/A << /Type /Action /S /GoTo /D [{0} /XYZ {1:f} {2:f} 0] >>',
-                *bookmark['destination']))
+                '/A << /Type /Action /S /GoTo '
+                '/D [{0} 0 R /XYZ {1:f} {2:f} 0] >>\n',
+                pdf.pages[page_num].object_number, pos_x, pos_y))
             if bookmark['Count']:
                 content.append(pdf_format('/Count {0}\n', bookmark['Count']))
             for key in ['Parent', 'Prev', 'Next', 'First', 'Last']:
                 if bookmark[key]:
                     content.append(pdf_format(
-                        '/{0} {1} 0 R\n', key, bookmark[key] + bookmark_root))
+                        '/{0} {1} 0 R\n', key, bookmark[key]))
             content.append(b'>>')
             pdf.write_new_object(b''.join(content))
 
+    embedded_files_id = _write_pdf_embedded_files(
+        pdf, metadata.attachments + (attachments or []), url_fetcher)
+
+    if bookmarks or embedded_files_id is not None:
+        params = b''
+        if bookmarks:
+            params += pdf_format(' /Outlines {0} 0 R /PageMode /UseOutlines',
+                                 bookmark_root_id)
+        if embedded_files_id is not None:
+            params += pdf_format(' /Names << /EmbeddedFiles {0} 0 R >>',
+                                 embedded_files_id)
+        pdf.extend_dict(pdf.catalog, params)
+
+    # A single link can be split in multiple regions. We don't want to embedded
+    # a file multiple times of course, so keep a reference to every embedded
+    # URL and reuse the object number.
+    # TODO: If we add support for descriptions this won't always be correct,
+    # because two links might have the same href, but different titles.
+    annot_files = _write_pdf_annotation_files(pdf, links, url_fetcher)
+
+    # TODO: splitting a link into multiple independent rectangular annotations
+    # works well for pure links, but rather mediocre for other annotations and
+    # fails completely for transformed (CSS) or complex link shapes (area).
+    # It would be better to use /AP for all links and coalesce link shapes that
+    # originate from the same HTML link. This would give a feeling similiar to
+    # what browsers do with links that span multiple lines.
     for page, page_links in zip(pdf.pages, links):
         annotations = []
-        for is_internal, target, rectangle in page_links:
+        for link_type, target, rectangle in page_links:
             content = [pdf_format(
-                '<< /Type /Annot /Subtype /Link '
-                    '/Rect [{0:f} {1:f} {2:f} {3:f}] /Border [0 0 0]\n',
+                '<< /Type /Annot '
+                '/Rect [{0:f} {1:f} {2:f} {3:f}] /Border [0 0 0]\n',
                 *rectangle)]
-            if is_internal == 'internal':
-                content.append(pdf_format(
-                    '/A << /Type /Action /S /GoTo '
+            if link_type != 'attachment' or annot_files[target] is None:
+                content.append(b'/Subtype /Link ')
+                if link_type == 'internal':
+                    content.append(pdf_format(
+                        '/A << /Type /Action /S /GoTo '
                         '/D [{0} /XYZ {1:f} {2:f} 0] >>\n',
-                    *target))
+                        *target))
+                else:
+                    content.append(pdf_format(
+                        '/A << /Type /Action /S /URI /URI ({0}) >>\n',
+                        iri_to_uri(target)))
             else:
+                assert not annot_files[target] is None
+
+                link_ap = pdf.write_new_object(pdf_format(
+                    '<< /Type /XObject /Subtype /Form '
+                    '/BBox [{0:f} {1:f} {2:f} {3:f}] /Length 0 >>\n'
+                    'stream\n'
+                    'endstream',
+                    *rectangle))
+                content.append(b'/Subtype /FileAttachment ')
+                # evince needs /T or fails on an internal assertion. PDF
+                # doesn't require it.
                 content.append(pdf_format(
-                    '/A << /Type /Action /S /URI /URI ({0}) >>\n',
-                    iri_to_uri(target)))
+                    '/T () /FS {0} 0 R /AP << /N {1} 0 R >>',
+                    annot_files[target], link_ap))
             content.append(b'>>')
             annotations.append(pdf.write_new_object(b''.join(content)))
 
@@ -472,4 +676,53 @@ def write_pdf_metadata(document, fileobj):
                 '/Annots [{0}]', ' '.join(
                     '{0} 0 R'.format(n) for n in annotations)))
 
+    info = [pdf_format('<< /Producer {0!P}\n', VERSION_STRING)]
+    for attr, key in (('title', 'Title'), ('description', 'Subject'),
+                      ('generator', 'Creator')):
+        value = getattr(metadata, attr)
+        if value is not None:
+            info.append(pdf_format('/{0} {1!P}', key, value))
+    for attr, key in (('authors', 'Author'), ('keywords', 'Keywords')):
+        value = getattr(metadata, attr)
+        if value is not None:
+            info.append(pdf_format('/{0} {1!P}', key, ', '.join(value)))
+    for attr, key in (('created', 'CreationDate'), ('modified', 'ModDate')):
+        value = w3c_date_to_pdf(getattr(metadata, attr), attr)
+        if value is not None:
+            info.append(pdf_format('/{0} (D:{1})', key, value))
+    # TODO: write metadata['CreationDate'] and metadata['ModDate'] as dates.
+    info.append(b' >>')
+    pdf.overwrite_object(pdf.info.object_number, b''.join(info))
+
     pdf.finish()
+
+
+def w3c_date_to_pdf(string, attr_name):
+    """
+    YYYYMMDDHHmmSSOHH'mm'
+
+    """
+    if string is None:
+        return None
+    match = W3C_DATE_RE.match(string)
+    if match is None:
+        LOGGER.warning('Invalid %s date: %r', attr_name, string)
+        return None
+    groups = match.groupdict()
+    pdf_date = (groups['year']
+                + (groups['month'] or '')
+                + (groups['day'] or '')
+                + (groups['hour'] or '')
+                + (groups['minute'] or '')
+                + (groups['second'] or ''))
+    if groups['hour']:
+        assert groups['minute']
+        if not groups['second']:
+            pdf_date += '00'
+        if groups['tz_hour']:
+            assert groups['tz_hour'].startswith(('+', '-'))
+            assert groups['tz_minute']
+            pdf_date += "%s'%s'" % (groups['tz_hour'], groups['tz_minute'])
+        else:
+            pdf_date += 'Z'  # UTC
+    return pdf_date
